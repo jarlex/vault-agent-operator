@@ -1,0 +1,138 @@
+# =============================================================================
+# vault-operator-agent — MVP Zero-Config Docker Compose
+# =============================================================================
+# One-command startup for testing and demos. No certificates, no tokens to
+# configure, no external dependencies beyond Docker.
+#
+# Usage:
+#   docker-compose -f docker-compose.mvp.yaml up --build
+#
+# What it does:
+#   1. Starts Vault in dev mode (root token: dev-token)
+#   2. Seeds Vault with test data (KV secrets, PKI, policies)
+#   3. Starts vault-operator-agent with mTLS DISABLED
+#   4. Everything is wired together automatically
+#
+# Example curl commands (after startup):
+#
+#   # Health check
+#   curl http://localhost:8000/api/v1/health
+#
+#   # List available models
+#   curl http://localhost:8000/api/v1/models
+#
+#   # List secrets
+#   curl -X POST http://localhost:8000/api/v1/tasks \
+#     -H "Content-Type: application/json" \
+#     -d '{"prompt": "list secrets under the path secret/"}'
+#
+#   # Read a specific secret
+#   curl -X POST http://localhost:8000/api/v1/tasks \
+#     -H "Content-Type: application/json" \
+#     -d '{"prompt": "read the secret at secret/myapp/database"}'
+#
+#   # Read API key
+#   curl -X POST http://localhost:8000/api/v1/tasks \
+#     -H "Content-Type: application/json" \
+#     -d '{"prompt": "read the secret at secret/myapp/api-key"}'
+#
+#   # Run the automated smoke test
+#   ./scripts/test-mvp.sh
+#
+# =============================================================================
+
+services:
+  # ---------------------------------------------------------------------------
+  # vault — HashiCorp Vault dev server
+  # ---------------------------------------------------------------------------
+  vault:
+    image: hashicorp/vault:1.17
+    container_name: vault-mvp
+    cap_add:
+      - IPC_LOCK
+    ports:
+      - "8200:8200"
+    environment:
+      - VAULT_DEV_ROOT_TOKEN_ID=dev-token
+      - VAULT_DEV_LISTEN_ADDRESS=0.0.0.0:8200
+      - VAULT_ADDR=http://0.0.0.0:8200
+    healthcheck:
+      test: ["CMD", "vault", "status"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    networks:
+      - vault-mvp-net
+
+  # ---------------------------------------------------------------------------
+  # vault-seed — Init container that seeds Vault with test data
+  # ---------------------------------------------------------------------------
+  vault-seed:
+    image: hashicorp/vault:1.17
+    container_name: vault-seed
+    depends_on:
+      vault:
+        condition: service_healthy
+    environment:
+      - VAULT_ADDR=http://vault:8200
+      - VAULT_TOKEN=dev-token
+    volumes:
+      - ./scripts/seed-vault.sh:/scripts/seed-vault.sh:ro
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        echo "==> Running Vault seed script..."
+        chmod +x /scripts/seed-vault.sh
+        /scripts/seed-vault.sh
+        echo "==> Seed complete. Container will exit."
+    networks:
+      - vault-mvp-net
+    restart: "no"
+
+  # ---------------------------------------------------------------------------
+  # vault-operator-agent — AI agent (mTLS DISABLED for MVP)
+  # ---------------------------------------------------------------------------
+  vault-operator-agent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: vault-operator-agent-mvp
+    ports:
+      - "8000:8000"
+    environment:
+      # Vault connection
+      - VAULT_ADDR=http://vault:8200
+      - VAULT_TOKEN=dev-token
+      # MCP transport — stdio (embedded binary)
+      - MCP__TRANSPORT=stdio
+      - MCP__SERVER_BINARY=/usr/local/bin/vault-mcp-server
+      - MCP__VAULT_ADDR=http://vault:8200
+      - MCP__VAULT_TOKEN=dev-token
+      # mTLS DISABLED for easy testing
+      - MTLS__ENABLED=false
+      # LLM — requires GITHUB_TOKEN from host environment
+      - GITHUB_TOKEN=${GITHUB_TOKEN}
+      - LLM__DEFAULT_MODEL=default
+      # Logging
+      - LOGGING__LEVEL=INFO
+      # Scheduler — disabled for MVP simplicity
+      - SCHEDULER__ENABLED=false
+    depends_on:
+      vault:
+        condition: service_healthy
+      vault-seed:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8000/api/v1/health"]
+      interval: 15s
+      timeout: 10s
+      start_period: 20s
+      retries: 5
+    networks:
+      - vault-mvp-net
+    restart: unless-stopped
+
+networks:
+  vault-mvp-net:
+    driver: bridge

@@ -1,0 +1,79 @@
+# =============================================================================
+# vault-operator-agent — Default Configuration
+# =============================================================================
+# This file provides base configuration values.  Environment variables ALWAYS
+# override values defined here.
+#
+# Env-var mapping examples:
+#   api.port        -> API__PORT=8080
+#   mcp.vault_addr  -> MCP__VAULT_ADDR=http://vault:8200  (or VAULT_ADDR)
+#   llm.default_model -> LLM__DEFAULT_MODEL=fast  (or DEFAULT_MODEL)
+#   logging.level   -> LOGGING__LEVEL=DEBUG  (or LOG_LEVEL)
+# =============================================================================
+
+api:
+  host: "0.0.0.0"
+  port: 8000
+  request_timeout: 120  # seconds — overall per-request timeout
+
+mtls:
+  enabled: true
+  ca_cert_path: "/certs/ca.pem"
+  server_cert_path: "/certs/server.pem"
+  server_key_path: "/certs/server-key.pem"
+
+mcp:
+  transport: "stdio"  # "stdio" (subprocess) or "http" (sidecar SSE)
+  server_binary: "/usr/local/bin/vault-mcp-server"
+  server_url: "http://vault-mcp-server:3000"
+  vault_addr: "http://vault:8200"
+  vault_token: ""  # Set via VAULT_TOKEN env var or Docker secret
+  tool_timeout: 30  # seconds — per MCP tool invocation
+  reconnect_initial_delay: 1.0
+  reconnect_max_delay: 60.0
+
+llm:
+  default_model: "default"
+  request_timeout: 60  # seconds
+  max_retries: 3
+  models:
+    - name: "default"
+      provider: "github"
+      model_id: "github/gpt-4o"
+      supports_tool_calling: true
+    - name: "fast"
+      provider: "github"
+      model_id: "github/gpt-4o-mini"
+      supports_tool_calling: true
+    - name: "llama"
+      provider: "github"
+      model_id: "github/meta-llama-3.1-70b-instruct"
+      supports_tool_calling: true
+
+agent:
+  max_iterations: 10
+  system_prompt_path: "config/prompts/system.md"
+
+scheduler:
+  enabled: true
+  tasks:
+    - id: "health_check"
+      cron: "*/5 * * * *"
+      prompt: "Check Vault server health and report status"
+      enabled: true
+    - id: "rotation_reminder"
+      cron: "0 9 * * 1"
+      prompt: "List all KV secrets and identify any that may need rotation based on their age"
+      enabled: false  # Enable when ready
+
+logging:
+  level: "INFO"
+  format: "json"
+  redact_patterns:
+    - "token"
+    - "password"
+    - "secret"
+    - "key"
+    - "authorization"
+    - "credential"
+    - "private"

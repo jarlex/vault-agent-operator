@@ -1,0 +1,88 @@
+# =============================================================================
+# vault-operator-agent — Production-like Docker Compose
+# =============================================================================
+# Services:
+#   - vault-operator-agent: The AI agent (FastAPI + vault-mcp-server binary)
+#   - vault: HashiCorp Vault in dev mode
+#
+# Prerequisites:
+#   - Generate certs: ./scripts/generate-certs.sh
+#   - Create secrets: mkdir -p secrets && echo "dev-token" > secrets/vault_token
+#   - Set GITHUB_TOKEN env var
+#
+# Usage:
+#   docker-compose up --build
+# =============================================================================
+
+services:
+  # ---------------------------------------------------------------------------
+  # vault-operator-agent — AI agent with embedded vault-mcp-server
+  # ---------------------------------------------------------------------------
+  vault-operator-agent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: vault-operator-agent
+    ports:
+      - "8000:8000"
+    environment:
+      # Vault connection (used by vault-mcp-server subprocess)
+      - VAULT_ADDR=http://vault:8200
+      - VAULT_TOKEN=dev-token
+      # MCP transport
+      - MCP__TRANSPORT=stdio
+      - MCP__SERVER_BINARY=/usr/local/bin/vault-mcp-server
+      # mTLS — enabled by default
+      - MTLS__ENABLED=${MTLS_ENABLED:-true}
+      - MTLS__CA_CERT_PATH=/certs/ca.pem
+      - MTLS__SERVER_CERT_PATH=/certs/server.pem
+      - MTLS__SERVER_KEY_PATH=/certs/server-key.pem
+      # LLM
+      - GITHUB_TOKEN=${GITHUB_TOKEN}
+      - LLM__DEFAULT_MODEL=${LLM_DEFAULT_MODEL:-default}
+      # Logging
+      - LOGGING__LEVEL=${LOG_LEVEL:-INFO}
+      # Scheduler
+      - SCHEDULER__ENABLED=${SCHEDULER_ENABLED:-true}
+    volumes:
+      - ./certs:/certs:ro
+    depends_on:
+      vault:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8000/api/v1/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 15s
+      retries: 3
+    networks:
+      - vault-net
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # vault — HashiCorp Vault (dev mode)
+  # ---------------------------------------------------------------------------
+  vault:
+    image: hashicorp/vault:1.17
+    container_name: vault-dev
+    cap_add:
+      - IPC_LOCK
+    ports:
+      - "8200:8200"
+    environment:
+      - VAULT_DEV_ROOT_TOKEN_ID=dev-token
+      - VAULT_DEV_LISTEN_ADDRESS=0.0.0.0:8200
+      - VAULT_ADDR=http://0.0.0.0:8200
+    healthcheck:
+      test: ["CMD", "vault", "status"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+    networks:
+      - vault-net
+    restart: unless-stopped
+
+networks:
+  vault-net:
+    driver: bridge

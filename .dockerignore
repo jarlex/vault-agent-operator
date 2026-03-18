@@ -1,0 +1,49 @@
+# Version control
+.git
+.gitignore
+
+# Python bytecode & caches
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.mypy_cache
+.pytest_cache
+.ruff_cache
+
+# Virtual environments
+venv/
+.venv/
+
+# Tests (not needed in production image)
+tests/
+
+# Environment & secrets
+.env
+.env.*
+certs/
+
+# Node (if any tooling uses it)
+node_modules/
+
+# IDE & editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Docker & CI
+docker-compose*.yaml
+Dockerfile
+.dockerignore
+
+# Documentation & specs (not needed at runtime)
+openspec/
+.atl/
+*.md
+!config/**/*.md
+
+# Build artifacts
+dist/
+build/
+*.egg-info
