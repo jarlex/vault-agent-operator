@@ -100,16 +100,7 @@ vault secrets tune -max-lease-ttl=8760h pki 2>/dev/null || true
 echo "--- Configuring PKI Root CA..."
 existing_ca=$(vault read -format=json pki/cert/ca 2>/dev/null || echo "")
 
-if [ -z "${existing_ca}" ] || echo "${existing_ca}" | python3 -c "
-import sys, json
-try:
-    data = json.load(sys.stdin)
-    cert = data.get('data', {}).get('certificate', '')
-    if not cert:
-        sys.exit(1)
-except:
-    sys.exit(1)
-" 2>/dev/null; then
+if [ -z "${existing_ca}" ] || echo "${existing_ca}" | jq -e '.data.certificate // empty' >/dev/null 2>&1; then
     echo "    Root CA already exists, skipping generation"
 else
     vault write pki/root/generate/internal \

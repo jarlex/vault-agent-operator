@@ -84,23 +84,12 @@ api_call() {
 
 # Check if response is valid JSON
 is_json() {
-    echo "$1" | python3 -c "import sys,json; json.load(sys.stdin)" 2>/dev/null
+    echo "$1" | jq empty 2>/dev/null
 }
 
 # Extract a field from JSON response
 json_field() {
-    echo "${RESPONSE}" | python3 -c "
-import sys, json
-try:
-    data = json.load(sys.stdin)
-    keys = '$1'.split('.')
-    val = data
-    for k in keys:
-        val = val[k]
-    print(val)
-except:
-    print('')
-" 2>/dev/null
+    echo "${RESPONSE}" | jq -r ".$1 // empty" 2>/dev/null
 }
 
 # ---------------------------------------------------------------------------
@@ -122,7 +111,7 @@ while [ "${SECONDS_WAITED}" -lt "${TIMEOUT}" ]; do
     health_response=$(curl -sf --max-time 5 "${BASE_URL}${API_PREFIX}/health" 2>/dev/null) || health_response=""
 
     if [ -n "${health_response}" ]; then
-        health_status=$(echo "${health_response}" | python3 -c "import sys,json; print(json.load(sys.stdin).get('status',''))" 2>/dev/null || echo "")
+        health_status=$(echo "${health_response}" | jq -r '.status // empty' 2>/dev/null || echo "")
         if [ "${health_status}" = "healthy" ] || [ "${health_status}" = "degraded" ]; then
             echo "    Agent is ${health_status} (waited ${SECONDS_WAITED}s)"
             HEALTH_OK=true
@@ -174,13 +163,7 @@ log_test "GET /health — response has required fields"
 api_call GET "/health"
 
 if [ "${HTTP_CODE}" = "200" ] && is_json "${RESPONSE}"; then
-    has_fields=$(echo "${RESPONSE}" | python3 -c "
-import sys, json
-data = json.load(sys.stdin)
-required = ['status']
-missing = [f for f in required if f not in data]
-print('ok' if not missing else ','.join(missing))
-" 2>/dev/null)
+    has_fields=$(echo "${RESPONSE}" | jq -r 'if has("status") then "ok" else "status" end' 2>/dev/null)
     if [ "${has_fields}" = "ok" ]; then
         log_pass "All required fields present"
     else
@@ -198,12 +181,7 @@ api_call GET "/models"
 
 if [ "${HTTP_CODE}" = "200" ]; then
     if is_json "${RESPONSE}"; then
-        model_count=$(echo "${RESPONSE}" | python3 -c "
-import sys, json
-data = json.load(sys.stdin)
-models = data.get('available_models', data.get('models', []))
-print(len(models))
-" 2>/dev/null || echo "0")
+        model_count=$(echo "${RESPONSE}" | jq -r '[.available_models // .models // []] | .[0] | length' 2>/dev/null || echo "0")
         if [ "${model_count}" -gt "0" ]; then
             log_pass "HTTP 200, ${model_count} model(s) available"
         else
