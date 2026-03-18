@@ -223,6 +223,11 @@ class MCPClient:
         Returns a list of dicts suitable for passing as ``tools`` to
         ``litellm.acompletion()``.
 
+        The OpenAI function-calling API requires that every ``"object"``-type
+        schema has a ``"properties"`` key (at minimum ``{}``).  MCP tools may
+        omit it when the tool takes no parameters (e.g. ``list_mounts``), so
+        we normalise the schema defensively before returning it.
+
         Format::
 
             [
@@ -243,11 +248,73 @@ class MCPClient:
                 "function": {
                     "name": tool.name,
                     "description": tool.description,
-                    "parameters": tool.input_schema,
+                    "parameters": self._normalise_schema(tool.input_schema),
                 },
             }
             for tool in self._tools
         ]
+
+    # ------------------------------------------------------------------
+    # Schema normalisation
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _normalise_schema(schema: dict[str, Any]) -> dict[str, Any]:
+        """Ensure an MCP input schema is valid for the OpenAI function-calling API.
+
+        OpenAI requires every ``"object"``-type schema to have a
+        ``"properties"`` key.  MCP servers may emit ``{"type": "object"}``
+        for tools that accept no parameters, which is valid JSON Schema but
+        rejected by OpenAI / GitHub Models.
+
+        This method:
+        * Defaults ``type`` to ``"object"`` when missing.
+        * Adds ``"properties": {}`` when the type is ``"object"`` and
+          ``properties`` is absent.
+        * Recursively normalises nested object schemas inside ``properties``.
+
+        The input dict is **not** mutated; a shallow copy is returned when
+        changes are needed.
+        """
+        if not schema:
+            return {"type": "object", "properties": {}}
+
+        needs_copy = False
+
+        # Ensure type is present
+        schema_type = schema.get("type", "object")
+        if "type" not in schema:
+            needs_copy = True
+
+        if schema_type == "object":
+            # Ensure properties key exists
+            if "properties" not in schema:
+                needs_copy = True
+
+            # Check if any nested property schemas need normalising
+            props = schema.get("properties", {})
+            normalised_props: dict[str, Any] | None = None
+            for key, prop_schema in props.items():
+                if isinstance(prop_schema, dict) and prop_schema.get("type") == "object":
+                    norm = MCPClient._normalise_schema(prop_schema)
+                    if norm is not prop_schema:
+                        if normalised_props is None:
+                            normalised_props = dict(props)
+                        normalised_props[key] = norm
+
+            if normalised_props is not None:
+                needs_copy = True
+
+            if needs_copy:
+                result = dict(schema)
+                result.setdefault("type", "object")
+                if normalised_props is not None:
+                    result["properties"] = normalised_props
+                else:
+                    result.setdefault("properties", {})
+                return result
+
+        return schema
 
     # ------------------------------------------------------------------
     # Tool invocation
@@ -281,7 +348,20 @@ class MCPClient:
             raise MCPConnectionError("Not connected to vault-mcp-server")
 
         start = time.monotonic()
-        logger.info("mcp.tool.calling", tool_name=name, arguments=arguments)
+
+        # INFO: only tool name (no arguments — they may contain secrets after
+        # placeholder restoration).
+        logger.info("mcp.tool.calling", tool_name=name)
+
+        # WARNING: DEBUG logging below may expose secret values (Vault tokens,
+        # passwords, API keys, etc.).  This is acceptable in development but
+        # MUST NOT be used in production.  Ensure LOG_LEVEL is INFO or higher
+        # in any production deployment.
+        logger.debug(
+            "mcp.tool.request",
+            tool_name=name,
+            arguments=arguments,
+        )
 
         try:
             result = await asyncio.wait_for(
@@ -300,6 +380,16 @@ class MCPClient:
                 tool_name=name,
                 is_error=is_error,
                 duration_ms=duration_ms,
+            )
+
+            # WARNING: DEBUG logging of raw tool result content may expose
+            # secret values.  Only enable DEBUG level in development.
+            logger.debug(
+                "mcp.tool.response_raw",
+                tool_name=name,
+                is_error=is_error,
+                duration_ms=duration_ms,
+                content=content,
             )
 
             return ToolResult(content=content, is_error=is_error)

@@ -90,10 +90,9 @@ class SecretRedactor:
         try:
             redaction_result = policy.redact(tool_name, result)
             redacted = redaction_result["redacted"]
-            unredacted = redaction_result["unredacted"]
         except Exception:
             # If redaction fails, use ultra-conservative fallback:
-            # redact EVERYTHING, store nothing.
+            # redact EVERYTHING.
             logger.exception(
                 "redaction.policy_error",
                 tool_name=tool_name,
@@ -103,15 +102,6 @@ class SecretRedactor:
                 "error": "Redaction processing failed. Tool result fully redacted for safety.",
                 "tool_name": tool_name,
             }
-            unredacted = result
-
-        # Store unredacted response for the API consumer
-        context.store_unredacted_response(tool_name, unredacted)
-
-        # Also scan the redacted result for any accidentally leaked secret values.
-        # This is a defense-in-depth check — policies should already handle this,
-        # but we double-check here.
-        redacted = self._scrub_known_secrets(redacted, context)
 
         logger.info(
             "redaction.tool_result_redacted",
@@ -177,7 +167,8 @@ class SecretRedactor:
 
         Vault or MCP server error messages might accidentally include secret
         values (e.g. "cannot write value 's3cret' to path ..."). This method
-        replaces any known secret values with ``[REDACTED]``.
+        replaces any known secret values (from the placeholder mapping) with
+        ``[REDACTED]``.
 
         Parameters
         ----------
@@ -194,22 +185,16 @@ class SecretRedactor:
         if not context.has_placeholders():
             return error_message
 
+        # Use resolve_all_placeholders in reverse: replace real values with [REDACTED]
+        # by iterating the known placeholder-to-value mappings.
         redacted = error_message
-        # We need to check if any known secret values appear in the error
-        # Access internal mapping through resolve — iterate placeholders
-        # Note: We use the context's resolve to check each known value
-        for response_entry in context.get_unredacted_responses():
-            response = response_entry.get("response")
-            if isinstance(response, dict):
-                redacted = self._redact_dict_values_from_string(redacted, response)
-            elif isinstance(response, str):
-                # Try to parse as JSON for value extraction
-                try:
-                    parsed = json.loads(response)
-                    if isinstance(parsed, dict):
-                        redacted = self._redact_dict_values_from_string(redacted, parsed)
-                except (json.JSONDecodeError, TypeError):
-                    pass
+        # Access the internal mapping via resolve to check each known value
+        # We iterate through placeholder indices (1-based) up to the counter
+        for i in range(1, context.placeholder_count + 1):
+            placeholder = f"[SECRET_VALUE_{i}]"
+            real_value = context.resolve_placeholder(placeholder)
+            if real_value and len(real_value) >= 4 and real_value in redacted:
+                redacted = redacted.replace(real_value, "[REDACTED]")
 
         return redacted
 
@@ -242,68 +227,3 @@ class SecretRedactor:
         elif isinstance(data, str):
             count += len(_PLACEHOLDER_PATTERN.findall(data))
         return count
-
-    def _scrub_known_secrets(self, data: Any, context: SecretContext) -> Any:
-        """Defense-in-depth: scan redacted output for any leaked secret values.
-
-        If any value in the redacted output matches a known secret value from
-        the context's unredacted responses, replace it with ``[REDACTED]``.
-
-        This is a safety net — well-written policies should never leak secrets,
-        but this catches edge cases and policy bugs.
-        """
-        # Collect all known secret values from unredacted responses
-        known_secrets: set[str] = set()
-        for entry in context.get_unredacted_responses():
-            response = entry.get("response")
-            self._extract_string_values(response, known_secrets)
-
-        if not known_secrets:
-            return data
-
-        return self._replace_known_secrets(data, known_secrets)
-
-    def _extract_string_values(self, data: Any, values: set[str]) -> None:
-        """Recursively extract all string values from a data structure."""
-        if isinstance(data, dict):
-            for v in data.values():
-                self._extract_string_values(v, values)
-        elif isinstance(data, list):
-            for item in data:
-                self._extract_string_values(item, values)
-        elif isinstance(data, str):
-            # Only consider values that look like they could be secrets
-            # (skip very short strings, common words, paths, etc.)
-            stripped = data.strip()
-            if len(stripped) >= 4 and not stripped.startswith("/"):
-                values.add(stripped)
-
-    def _replace_known_secrets(self, data: Any, known_secrets: set[str]) -> Any:
-        """Replace any occurrence of known secret values in the data."""
-        if isinstance(data, dict):
-            return {k: self._replace_known_secrets(v, known_secrets) for k, v in data.items()}
-        elif isinstance(data, list):
-            return [self._replace_known_secrets(item, known_secrets) for item in data]
-        elif isinstance(data, str):
-            result = data
-            for secret in known_secrets:
-                if secret in result:
-                    result = result.replace(secret, "[REDACTED]")
-                    logger.warning(
-                        "redaction.defense_in_depth_triggered",
-                        message="Secret value found in supposedly redacted output — replaced.",
-                        # NEVER log the actual secret value
-                    )
-            return result
-        else:
-            return data
-
-    def _redact_dict_values_from_string(self, text: str, data: dict[str, Any]) -> str:
-        """Replace any dict values that appear in a string with [REDACTED]."""
-        result = text
-        for value in data.values():
-            if isinstance(value, str) and len(value) >= 4 and value in result:
-                result = result.replace(value, "[REDACTED]")
-            elif isinstance(value, dict):
-                result = self._redact_dict_values_from_string(result, value)
-        return result

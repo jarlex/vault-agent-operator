@@ -114,8 +114,11 @@ services:
       # LLM — requires GITHUB_TOKEN from host environment
       - GITHUB_TOKEN=${GITHUB_TOKEN}
       - LLM__DEFAULT_MODEL=default
-      # Logging
-      - LOGGING__LEVEL=INFO
+      # Logging — DEBUG level for development (shows MCP tool requests/responses)
+      # WARNING: DEBUG level may expose secret values in logs. Use INFO or
+      # higher in production.
+      - LOGGING__LEVEL=DEBUG
+      - LOGGING__FORMAT=console
       # Scheduler — disabled for MVP simplicity
       - SCHEDULER__ENABLED=false
     depends_on:

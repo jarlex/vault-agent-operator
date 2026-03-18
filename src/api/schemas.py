@@ -3,11 +3,6 @@
 All API payloads are validated through these schemas. The models enforce
 constraints from the specification (e.g. prompt max length 4096) and provide
 structured, consistent response formats.
-
-Security note:
-    ``TaskResponse.unredacted_data`` contains real secret values intended ONLY
-    for the API consumer. This field is populated from ``AgentResult.unredacted_responses``
-    and MUST NOT be logged.
 """
 
 from __future__ import annotations
@@ -56,35 +51,32 @@ class TaskRequest(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-class ToolCallDetail(BaseModel):
-    """A single tool invocation in the audit trail."""
-
-    tool_name: str
-    arguments: dict[str, Any]
-    result: str
-    is_error: bool
-    duration_ms: int
-
-
 class TaskResponse(BaseModel):
-    """POST /api/v1/tasks response body."""
+    """POST /api/v1/tasks response body.
+
+    **Raw-Response Architecture**:
+        The ``data`` field contains the raw Vault tool results — this is the
+        primary structured output for API consumers. The ``result`` field
+        contains a string representation (JSON for tool results, or LLM text
+        if no tools were called).
+    """
 
     status: Literal["completed", "error"]
-    result: str = Field(description="Agent's final text response or error message.")
-    model_used: str = Field(description="LLM model ID that was used.")
-    tool_calls: list[ToolCallDetail] = Field(
-        default_factory=list,
-        description="Ordered audit trail of MCP tool invocations.",
-    )
-    duration_ms: int = Field(description="Total processing time in milliseconds.")
-    error: str | None = Field(default=None, description="Error message if status is 'error'.")
-    unredacted_data: list[dict[str, Any]] | None = Field(
+    result: str = Field(description=(
+        "Raw tool output (JSON string) when tools were called, "
+        "or LLM text when no tools were invoked (error/explanation)."
+    ))
+    data: list[dict[str, Any]] | None = Field(
         default=None,
         description=(
-            "Full unredacted MCP tool responses for the consumer. "
-            "Contains real secret values — the consumer explicitly requested this data."
+            "Structured raw Vault tool results. Each entry has 'tool_name', "
+            "'result' (raw MCP response), and 'is_error'. This is the primary "
+            "output for API consumers — use this instead of parsing 'result'."
         ),
     )
+    model_used: str = Field(description="LLM model ID that was used.")
+    duration_ms: int = Field(description="Total processing time in milliseconds.")
+    error: str | None = Field(default=None, description="Error message if status is 'error'.")
 
 
 class HealthResponse(BaseModel):

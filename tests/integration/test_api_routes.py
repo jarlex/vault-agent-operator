@@ -13,7 +13,6 @@ Test coverage maps to specification scenarios:
     - LLM unreachable → agent error → 503
     - MCP unreachable → agent error → 503
     - X-Request-ID in response headers
-    - unredacted_data included in response
     - Structured JSON error responses (never raw tracebacks)
 
     GET /api/v1/health
@@ -131,10 +130,11 @@ class TestTasksHappyPath:
                 ],
                 model_used="github/gpt-4o",
                 iterations=2,
-                unredacted_responses=[
+                raw_tool_results=[
                     {
                         "tool_name": "vault_kv_read",
-                        "response": {"data": {"username": "admin", "password": "s3cret"}},
+                        "result": '{"data": {"username": "admin", "password": "s3cret"}}',
+                        "is_error": False,
                     }
                 ],
             ),
@@ -147,17 +147,19 @@ class TestTasksHappyPath:
         assert body["status"] == "completed"
         assert "kv/myapp/database" in body["result"]
         assert body["model_used"] == "github/gpt-4o"
-        assert len(body["tool_calls"]) == 1
-        assert body["tool_calls"][0]["tool_name"] == "vault_kv_read"
+        assert body["data"] is not None
+        assert len(body["data"]) == 1
+        assert body["data"][0]["tool_name"] == "vault_kv_read"
         assert body["duration_ms"] >= 0
         assert body["error"] is None
 
-    def test_successful_task_includes_unredacted_data(self):
-        """Spec: API response includes unredacted_data for consumer (real secret values)."""
-        unredacted = [
+    def test_successful_task_includes_data_field(self):
+        """Spec: API response includes structured data for consumer."""
+        raw_results = [
             {
                 "tool_name": "vault_kv_read",
-                "response": {"data": {"username": "admin", "password": "s3cret!123"}},
+                "result": '{"data": {"username": "admin", "password": "s3cret!123"}}',
+                "is_error": False,
             }
         ]
         client = _make_app(
@@ -167,7 +169,7 @@ class TestTasksHappyPath:
                 tool_calls=[],
                 model_used="github/gpt-4o",
                 iterations=1,
-                unredacted_responses=unredacted,
+                raw_tool_results=raw_results,
             ),
         )
 
@@ -175,10 +177,10 @@ class TestTasksHappyPath:
 
         assert resp.status_code == 200
         body = resp.json()
-        assert body["unredacted_data"] is not None
-        assert len(body["unredacted_data"]) == 1
-        assert body["unredacted_data"][0]["tool_name"] == "vault_kv_read"
-        assert body["unredacted_data"][0]["response"]["data"]["password"] == "s3cret!123"
+        assert body["data"] is not None
+        assert len(body["data"]) == 1
+        assert body["data"][0]["tool_name"] == "vault_kv_read"
+        assert "s3cret!123" in body["data"][0]["result"]
 
     def test_request_id_in_response_headers(self):
         """Spec: Every response includes X-Request-ID header."""

@@ -93,37 +93,6 @@ class TestSecretContextPlaceholders:
         assert ctx.has_placeholders() is True
 
 
-class TestSecretContextUnredactedResponses:
-    """Test unredacted response storage in SecretContext."""
-
-    def test_store_and_retrieve_unredacted(self) -> None:
-        """GIVEN a tool response, WHEN stored, THEN it can be retrieved."""
-        ctx = SecretContext()
-        ctx.store_unredacted_response("vault_kv_read", {"password": "secret"})
-        responses = ctx.get_unredacted_responses()
-        assert len(responses) == 1
-        assert responses[0]["tool_name"] == "vault_kv_read"
-        assert responses[0]["response"]["password"] == "secret"
-
-    def test_multiple_responses_preserved_in_order(self) -> None:
-        """GIVEN multiple stored responses, WHEN retrieved, THEN order is preserved."""
-        ctx = SecretContext()
-        ctx.store_unredacted_response("tool_a", {"a": 1})
-        ctx.store_unredacted_response("tool_b", {"b": 2})
-        responses = ctx.get_unredacted_responses()
-        assert len(responses) == 2
-        assert responses[0]["tool_name"] == "tool_a"
-        assert responses[1]["tool_name"] == "tool_b"
-
-    def test_get_returns_copy(self) -> None:
-        """GIVEN stored responses, WHEN retrieved, THEN modifying the result doesn't affect the context."""
-        ctx = SecretContext()
-        ctx.store_unredacted_response("tool", {"x": 1})
-        responses = ctx.get_unredacted_responses()
-        responses.clear()
-        assert len(ctx.get_unredacted_responses()) == 1
-
-
 class TestSecretContextLifecycle:
     """Test SecretContext lifecycle: destroy, context manager, non-serializable."""
 
@@ -132,7 +101,6 @@ class TestSecretContextLifecycle:
         THEN all data is cleared and further access raises RuntimeError."""
         ctx = SecretContext()
         ctx.create_placeholder("secret")
-        ctx.store_unredacted_response("tool", {"data": "val"})
 
         ctx.destroy()
 
@@ -141,10 +109,6 @@ class TestSecretContextLifecycle:
             ctx.create_placeholder("another")
         with pytest.raises(RuntimeError, match="destroyed"):
             ctx.resolve_placeholder("[SECRET_VALUE_1]")
-        with pytest.raises(RuntimeError, match="destroyed"):
-            ctx.store_unredacted_response("tool", {})
-        with pytest.raises(RuntimeError, match="destroyed"):
-            ctx.get_unredacted_responses()
 
     def test_context_manager_destroys_on_exit(self) -> None:
         """GIVEN a SecretContext used as a context manager,
@@ -239,11 +203,6 @@ class TestSecretRedactorKVRead:
         assert "admin" not in redacted_str
         assert "s3cret!123" not in redacted_str
 
-        # Unredacted response stored for consumer
-        unredacted = ctx.get_unredacted_responses()
-        assert len(unredacted) == 1
-        assert unredacted[0]["response"]["data"]["password"] == "s3cret!123"
-
     def test_kv_read_v2_nested_data(self) -> None:
         """GIVEN a KV v2 result with nested data.data, WHEN redacted,
         THEN the inner data keys are extracted and values are stripped."""
@@ -333,12 +292,6 @@ class TestSecretRedactorPKI:
         # in the unredacted response. This is expected (safe > useful).
         assert redacted["private_key"] == "[REDACTED_PEM_CONTENT]"
         assert redacted["certificate"] == "[REDACTED_PEM_CONTENT]"
-
-        # Unredacted data is preserved for the API consumer
-        unredacted = ctx.get_unredacted_responses()
-        assert len(unredacted) == 1
-        consumer_data = unredacted[0]["response"]
-        assert "-----BEGIN RSA PRIVATE KEY-----" in consumer_data["data"]["private_key"]
 
 
 class TestSecretRedactorConservative:
@@ -459,19 +412,15 @@ class TestSecretRedactorErrorMessage:
         """GIVEN an error message containing a known secret value,
         WHEN redacted, THEN the secret value is replaced with [REDACTED].
 
-        NOTE: redact_error_message only scans unredacted responses if the
-        context has placeholders (has_placeholders() check). In a real flow,
-        the PromptSanitizer would have created placeholders before the error
-        occurs, so we simulate that here."""
+        NOTE: redact_error_message scans the placeholder-to-value mapping
+        to find known secret values. In a real flow, the PromptSanitizer
+        would have created placeholders before the error occurs."""
         ctx = SecretContext()
         redactor = SecretRedactor()
 
-        # Create a placeholder first — required for redact_error_message to
-        # proceed past the has_placeholders() guard.
+        # Create a placeholder — this registers the secret value in the
+        # placeholder-to-value mapping used by redact_error_message.
         ctx.create_placeholder("s3cret!123")
-
-        # Simulate a previous tool call that returned the secret
-        ctx.store_unredacted_response("vault_kv_read", {"password": "s3cret!123"})
 
         error = "cannot write value 's3cret!123' to path kv/prod/db: permission denied"
         safe_error = redactor.redact_error_message(error, ctx)
@@ -794,13 +743,6 @@ class TestEndToEndRedactionFlow:
         assert "username" in redacted_dict.get("keys", [])
         assert "password" in redacted_dict.get("keys", [])
 
-        # ASSERT: Consumer gets full unredacted data
-        unredacted = ctx.get_unredacted_responses()
-        assert len(unredacted) == 1
-        consumer_data = unredacted[0]["response"]
-        assert consumer_data["data"]["password"] == "Pr0duction$ecret!"
-        assert consumer_data["data"]["username"] == "db-admin"
-
     def test_pki_flow_private_key_never_reaches_llm(self) -> None:
         """GIVEN a PKI certificate issuance with a private key,
         WHEN redacted, THEN the private key PEM NEVER appears in the LLM result
@@ -838,10 +780,3 @@ class TestEndToEndRedactionFlow:
         assert "serial_number" in redacted
         assert "common_name" in redacted
         assert "private_key" in redacted
-
-        # Consumer gets everything (unredacted)
-        unredacted = ctx.get_unredacted_responses()
-        assert len(unredacted) == 1
-        consumer_data = unredacted[0]["response"]
-        assert consumer_data["data"]["private_key"] == private_key_pem
-        assert consumer_data["data"]["certificate"] == cert_pem

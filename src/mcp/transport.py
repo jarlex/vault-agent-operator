@@ -55,13 +55,11 @@ async def create_transport(config: MCPConfig) -> AsyncIterator[tuple[Any, Any]]:
         If the transport type is unsupported or connection fails.
     """
     if config.transport == "stdio":
-        async for streams in _create_stdio_transport(config):
+        async with _create_stdio_transport(config) as streams:
             yield streams
-            return
     elif config.transport == "http":
-        async for streams in _create_sse_transport(config):
+        async with _create_sse_transport(config) as streams:
             yield streams
-            return
     else:
         raise TransportError(f"Unsupported MCP transport: {config.transport!r}")
 

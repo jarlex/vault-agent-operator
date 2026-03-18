@@ -41,6 +41,7 @@ Dockerfile
 openspec/
 .atl/
 *.md
+!README.md
 !config/**/*.md
 
 # Build artifacts

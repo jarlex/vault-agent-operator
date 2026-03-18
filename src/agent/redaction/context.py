@@ -8,18 +8,12 @@ of real secret values during a request lifecycle. It is:
 - **Non-loggable**: ``__repr__`` and ``__str__`` never expose secret values.
 - **Ephemeral**: All secret values are cleared on ``destroy()``.
 
-The SecretContext serves two purposes:
-
-1. **Placeholder ↔ real value mapping**: When the PromptSanitizer extracts
-   secret values from a consumer's prompt, it stores them here keyed by opaque
-   placeholder tokens (e.g. ``[SECRET_VALUE_1]``). When the LLM produces a
-   tool call containing those placeholders, the SecretRedactor uses this
-   context to substitute the real values before forwarding to MCP.
-
-2. **Unredacted tool responses**: When the SecretRedactor strips secret values
-   from an MCP tool result before passing it to the LLM, it stores the full
-   unredacted result here. The API layer retrieves these to include in the
-   consumer-facing response.
+The SecretContext's purpose is **placeholder ↔ real value mapping**: When the
+PromptSanitizer extracts secret values from a consumer's prompt, it stores
+them here keyed by opaque placeholder tokens (e.g. ``[SECRET_VALUE_1]``).
+When the LLM produces a tool call containing those placeholders, the
+SecretRedactor uses this context to substitute the real values before
+forwarding to MCP.
 
 Usage::
 
@@ -27,9 +21,6 @@ Usage::
     token = ctx.create_placeholder("SuperS3cret!")
     # token == "[SECRET_VALUE_1]"
     ctx.resolve_placeholder(token)  # → "SuperS3cret!"
-
-    ctx.store_unredacted_response("vault_kv_read", {"password": "SuperS3cret!"})
-    ctx.get_unredacted_responses()  # → [{"tool_name": "vault_kv_read", "response": {...}}]
 
     ctx.destroy()  # Clears all data from memory
 """
@@ -72,7 +63,6 @@ class SecretContext:
     __slots__ = (
         "_placeholder_to_value",
         "_value_to_placeholder",
-        "_unredacted_responses",
         "_counter",
         "_lock",
         "_destroyed",
@@ -81,7 +71,6 @@ class SecretContext:
     def __init__(self) -> None:
         self._placeholder_to_value: dict[str, str] = {}
         self._value_to_placeholder: dict[str, str] = {}
-        self._unredacted_responses: list[dict[str, Any]] = []
         self._counter: int = 0
         self._lock = threading.Lock()
         self._destroyed: bool = False
@@ -195,59 +184,6 @@ class SecretContext:
             return len(self._placeholder_to_value)
 
     # ------------------------------------------------------------------
-    # Unredacted Response Storage
-    # ------------------------------------------------------------------
-
-    def store_unredacted_response(self, tool_name: str, response: Any) -> None:
-        """Store the full, unredacted MCP tool response for the API consumer.
-
-        The redacted version goes to the LLM; this full version is kept here
-        so the API layer can include it in the consumer-facing ``TaskResponse``.
-
-        Parameters
-        ----------
-        tool_name:
-            The MCP tool that produced this response.
-        response:
-            The complete, unredacted tool result.
-
-        Raises
-        ------
-        RuntimeError
-            If the context has been destroyed.
-        """
-        self._assert_alive()
-        with self._lock:
-            self._unredacted_responses.append({
-                "tool_name": tool_name,
-                "response": response,
-            })
-
-        logger.debug(
-            "secret_context.unredacted_response_stored",
-            tool_name=tool_name,
-            # NEVER log the response content
-        )
-
-    def get_unredacted_responses(self) -> list[dict[str, Any]]:
-        """Retrieve all stored unredacted tool responses.
-
-        Returns
-        -------
-        list[dict[str, Any]]
-            Each dict has ``"tool_name"`` and ``"response"`` keys.
-
-        Raises
-        ------
-        RuntimeError
-            If the context has been destroyed.
-        """
-        self._assert_alive()
-        with self._lock:
-            # Return a copy to prevent external mutation
-            return list(self._unredacted_responses)
-
-    # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
 
@@ -267,7 +203,6 @@ class SecretContext:
 
             self._placeholder_to_value.clear()
             self._value_to_placeholder.clear()
-            self._unredacted_responses.clear()
             self._counter = 0
             self._destroyed = True
 
@@ -286,7 +221,6 @@ class SecretContext:
         """Safe repr — never exposes secret values."""
         return (
             f"<SecretContext placeholders={self._counter} "
-            f"unredacted_responses={len(self._unredacted_responses)} "
             f"destroyed={self._destroyed}>"
         )
 

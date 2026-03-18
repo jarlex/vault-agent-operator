@@ -213,13 +213,15 @@ class MockMCPClient:
         return list(self._tools)
 
     def get_tools_as_openai_format(self) -> list[dict[str, Any]]:
+        from src.mcp.client import MCPClient
+
         return [
             {
                 "type": "function",
                 "function": {
                     "name": tool.name,
                     "description": tool.description,
-                    "parameters": tool.input_schema,
+                    "parameters": MCPClient._normalise_schema(tool.input_schema),
                 },
             }
             for tool in self._tools
@@ -425,7 +427,6 @@ def _build_test_app(
             tool_calls=[],
             model_used="github/gpt-4o",
             iterations=1,
-            unredacted_responses=[],
         ))
         agent = mock_agent
 

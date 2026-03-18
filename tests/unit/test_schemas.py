@@ -22,7 +22,6 @@ from src.api.schemas import (
     ModelsResponse,
     TaskRequest,
     TaskResponse,
-    ToolCallDetail,
 )
 
 
@@ -124,20 +123,19 @@ class TestTaskResponse:
             status="completed",
             result="The secret contains keys: username, password.",
             model_used="gpt-4o",
-            tool_calls=[
-                ToolCallDetail(
-                    tool_name="vault_kv_read",
-                    arguments={"path": "secret/db"},
-                    result='{"keys": ["username", "password"]}',
-                    is_error=False,
-                    duration_ms=150,
-                ),
+            data=[
+                {
+                    "tool_name": "vault_kv_read",
+                    "result": '{"keys": ["username", "password"]}',
+                    "is_error": False,
+                },
             ],
             duration_ms=2500,
         )
         assert resp.status == "completed"
         assert resp.error is None
-        assert len(resp.tool_calls) == 1
+        assert resp.data is not None
+        assert len(resp.data) == 1
 
     def test_valid_error_response(self) -> None:
         """GIVEN an error result, WHEN TaskResponse is created, THEN it validates."""
@@ -161,17 +159,17 @@ class TestTaskResponse:
                 duration_ms=1,
             )
 
-    def test_unredacted_data_field(self) -> None:
-        """GIVEN unredacted_data provided, WHEN created, THEN it's included."""
+    def test_data_field_with_tool_results(self) -> None:
+        """GIVEN data field with tool results, WHEN created, THEN it's included."""
         resp = TaskResponse(
             status="completed",
             result="Done",
             model_used="gpt-4o",
             duration_ms=100,
-            unredacted_data=[{"tool_name": "vault_kv_read", "response": {"password": "real"}}],
+            data=[{"tool_name": "vault_kv_read", "result": '{"password": "real"}', "is_error": False}],
         )
-        assert resp.unredacted_data is not None
-        assert len(resp.unredacted_data) == 1
+        assert resp.data is not None
+        assert len(resp.data) == 1
 
     def test_serialization_roundtrip(self) -> None:
         """GIVEN a TaskResponse, WHEN serialized to JSON and back, THEN it roundtrips correctly."""
@@ -180,20 +178,19 @@ class TestTaskResponse:
             result="Done",
             model_used="test",
             duration_ms=100,
-            tool_calls=[
-                ToolCallDetail(
-                    tool_name="tool1",
-                    arguments={"a": 1},
-                    result="ok",
-                    is_error=False,
-                    duration_ms=50,
-                ),
+            data=[
+                {
+                    "tool_name": "tool1",
+                    "result": "ok",
+                    "is_error": False,
+                },
             ],
         )
         data = resp.model_dump()
         restored = TaskResponse(**data)
         assert restored.status == "completed"
-        assert len(restored.tool_calls) == 1
+        assert restored.data is not None
+        assert len(restored.data) == 1
 
 
 # ===================================================================

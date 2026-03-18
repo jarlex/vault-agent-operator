@@ -1,13 +1,23 @@
 """Unit tests for AgentCore reasoning loop.
 
 Tests cover:
-- Single tool call flow (LLM returns tool call, then final text)
-- Multi-step flow (multiple tool calls before final response)
+- Single tool call flow (LLM returns tool call → raw result returned directly)
+- Multi-step flow (LLM returns multiple tool calls → raw results aggregated)
 - Max iterations exceeded
 - LLM error handling
-- MCP tool error fed back to LLM
-- Secret redaction applied in the reasoning loop
+- MCP tool error → retry via hybrid loop
+- Secret redaction applied in the reasoning loop (LLM never sees secrets)
 - Empty LLM response handling
+- Text-only response (LLM couldn't map to tool)
+- Raw tool result structure
+
+Hybrid Loop Architecture:
+    The LLM is ONLY used for INPUT processing (understanding intent, selecting
+    tools). After tool execution:
+    - All tools succeed → raw results returned directly (fast path, 1 iteration)
+    - Any tool fails → error fed back to LLM → LLM retries (new iteration)
+    - After max_iterations with only errors → last error returned
+    - LLM returns text → text returned to caller
 """
 
 from __future__ import annotations
@@ -42,35 +52,47 @@ from tests.conftest import MockLLMProvider, MockMCPClient
 class TestSingleToolCallFlow:
     """Test the reasoning loop with a single tool call.
 
-    Spec scenario: "Single tool call (simple read)"
+    Raw-Response Architecture: The LLM selects a tool, the tool executes,
+    and the raw result is returned directly. Only 1 iteration (no second
+    LLM call for summarization).
     """
 
     @pytest.mark.asyncio
-    async def test_single_tool_call_completes_in_two_iterations(
+    async def test_single_tool_call_completes_in_one_iteration(
         self, make_agent, mock_llm_with_tool_call, mock_mcp_kv_read,
     ) -> None:
         """GIVEN the agent receives a read prompt,
-        WHEN the LLM responds with one tool call and then final text,
-        THEN the loop completes in 2 iterations with status 'completed'."""
+        WHEN the LLM responds with one tool call,
+        THEN the loop completes in 1 iteration with status 'completed'
+        and returns raw tool results directly."""
         agent: AgentCore = make_agent(llm=mock_llm_with_tool_call, mcp=mock_mcp_kv_read)
 
         result = await agent.execute(prompt="read kv/myapp/db")
 
         assert result.status == "completed"
-        assert result.iterations == 2
+        assert result.iterations == 1
         assert len(result.tool_calls) == 1
         assert result.tool_calls[0].tool_name == "vault_kv_read"
         assert result.model_used == "test/mock-model"
+        # Raw tool results should be populated
+        assert len(result.raw_tool_results) == 1
+        assert result.raw_tool_results[0]["tool_name"] == "vault_kv_read"
+        assert result.raw_tool_results[0]["is_error"] is False
 
     @pytest.mark.asyncio
-    async def test_single_tool_call_result_text(
+    async def test_single_tool_call_result_contains_raw_vault_data(
         self, make_agent, mock_llm_with_tool_call, mock_mcp_kv_read,
     ) -> None:
         """GIVEN a single tool call flow, WHEN completed,
-        THEN result.result contains the LLM's final text response."""
+        THEN result.result contains the raw Vault JSON data (not LLM text)."""
         agent: AgentCore = make_agent(llm=mock_llm_with_tool_call, mcp=mock_mcp_kv_read)
         result = await agent.execute(prompt="read kv/myapp/db")
-        assert "read the secret" in result.result.lower() or "secret" in result.result.lower()
+
+        # Result should be raw JSON from Vault, containing actual data
+        parsed = json.loads(result.result)
+        assert "data" in parsed
+        assert parsed["data"]["username"] == "admin"
+        assert parsed["data"]["password"] == "s3cret!123"
 
     @pytest.mark.asyncio
     async def test_tool_call_records_audit_trail(
@@ -94,42 +116,28 @@ class TestSingleToolCallFlow:
 
 
 class TestMultiStepFlow:
-    """Test the reasoning loop with multiple sequential tool calls.
+    """Test the reasoning loop with multiple tool calls in a single LLM response.
 
-    Spec scenario: "Multi-step reasoning (compound operation)"
+    Raw-Response Architecture: The LLM selects multiple tools in one response,
+    all execute, and all raw results are returned in a single iteration.
     """
 
     @pytest.mark.asyncio
-    async def test_multi_step_flow(self, make_agent) -> None:
+    async def test_multiple_tool_calls_in_single_response(self, make_agent) -> None:
         """GIVEN a prompt requiring multiple tool calls,
-        WHEN the LLM calls two tools sequentially before final text,
-        THEN all tool calls are recorded and the final result is returned."""
+        WHEN the LLM returns multiple tool calls in one response,
+        THEN all tool calls execute and raw results are aggregated."""
         llm = MockLLMProvider(responses=[
-            # Step 1: LLM requests first tool call
+            # LLM requests two tool calls in one response
             LLMResponse(
                 content=None,
                 tool_calls=[
                     ToolCall(id="call_001", name="vault_kv_read", arguments={"path": "secret/app"}),
-                ],
-                model="test/mock-model",
-                usage=None,
-            ),
-            # Step 2: LLM requests second tool call
-            LLMResponse(
-                content=None,
-                tool_calls=[
                     ToolCall(id="call_002", name="vault_kv_write", arguments={
                         "path": "secret/app/copy",
                         "data": {"key": "value"},
                     }),
                 ],
-                model="test/mock-model",
-                usage=None,
-            ),
-            # Step 3: LLM produces final text
-            LLMResponse(
-                content="I read the secret and wrote a copy successfully.",
-                tool_calls=None,
                 model="test/mock-model",
                 usage=None,
             ),
@@ -150,10 +158,20 @@ class TestMultiStepFlow:
         result = await agent.execute(prompt="read secret/app and copy to secret/app/copy")
 
         assert result.status == "completed"
-        assert result.iterations == 3
+        assert result.iterations == 1
         assert len(result.tool_calls) == 2
         assert result.tool_calls[0].tool_name == "vault_kv_read"
         assert result.tool_calls[1].tool_name == "vault_kv_write"
+
+        # Raw results should contain both tool outputs
+        assert len(result.raw_tool_results) == 2
+        assert result.raw_tool_results[0]["tool_name"] == "vault_kv_read"
+        assert result.raw_tool_results[1]["tool_name"] == "vault_kv_write"
+
+        # Result string for multiple tools should be a JSON array
+        parsed = json.loads(result.result)
+        assert isinstance(parsed, list)
+        assert len(parsed) == 2
 
 
 # ===================================================================
@@ -164,24 +182,35 @@ class TestMultiStepFlow:
 class TestMaxIterationsExceeded:
     """Test behavior when reasoning loop hits max iterations.
 
-    Spec scenario: "Maximum iterations exceeded"
+    Hybrid Loop Architecture: max_iterations limits error-retry iterations.
+    Successful tool calls always return immediately on the first iteration.
+    Max iterations is reached when every iteration results in tool errors and
+    the LLM cannot recover.
+
+    See also: TestMCPToolError.test_mcp_error_exhausts_retries for the case
+    where retries are exhausted.
     """
 
     @pytest.mark.asyncio
-    async def test_max_iterations_returns_warning(self) -> None:
-        """GIVEN max_iterations=2 and the LLM keeps calling tools,
-        WHEN the loop hits the limit, THEN result has a warning about max iterations."""
-        # LLM always returns tool calls — never produces final text
-        endless_responses = [
+    async def test_tool_call_returns_immediately_regardless_of_max_iterations(self) -> None:
+        """GIVEN max_iterations=2 and the LLM returns a tool call,
+        WHEN the tool executes, THEN the result is returned in iteration 1
+        (the loop doesn't continue to iteration 2)."""
+        llm = MockLLMProvider(responses=[
             LLMResponse(
                 content=None,
-                tool_calls=[ToolCall(id=f"call_{i}", name="vault_kv_read", arguments={"path": "x"})],
+                tool_calls=[ToolCall(id="call_0", name="vault_kv_read", arguments={"path": "x"})],
                 model="test/mock-model",
                 usage=None,
-            )
-            for i in range(10)
-        ]
-        llm = MockLLMProvider(responses=endless_responses)
+            ),
+            # This response would be used in iteration 2, but should NOT be reached
+            LLMResponse(
+                content="This should never be reached.",
+                tool_calls=None,
+                model="test/mock-model",
+                usage=None,
+            ),
+        ])
 
         mcp = MockMCPClient(tool_results={
             "vault_kv_read": ToolResult(
@@ -201,10 +230,10 @@ class TestMaxIterationsExceeded:
         result = await agent.execute(prompt="read something")
 
         assert result.status == "completed"
-        assert result.iterations == 2
-        assert result.warning is not None
-        assert "max iterations" in result.warning.lower()
-        assert result.error_code == "max_iterations"
+        assert result.iterations == 1  # Returns immediately after tool call
+        assert len(result.tool_calls) == 1
+        assert result.raw_tool_results[0]["tool_name"] == "vault_kv_read"
+        assert result.warning is None  # No warning — completed normally
 
 
 # ===================================================================
@@ -305,23 +334,27 @@ class TestEmptyLLMResponse:
 
 
 # ===================================================================
-# MCP Tool Error → Fed Back to LLM
+# MCP Tool Error → Fed Back to LLM for Retry
 # ===================================================================
 
 
 class TestMCPToolError:
-    """Test that MCP tool errors are fed back to the LLM for reasoning.
+    """Test the hybrid loop error retry behavior.
 
-    Spec scenario: "MCP tool returns an error"
+    Hybrid Loop Architecture: When an MCP tool fails, the redacted error is
+    fed back to the LLM so it can retry with different parameters or a
+    different approach. The loop continues up to max_iterations. If the LLM
+    eventually succeeds, the raw result is returned. If all retries fail,
+    the last error is returned with status 'error'.
     """
 
     @pytest.mark.asyncio
-    async def test_mcp_error_fed_to_llm_then_final_response(self, make_agent) -> None:
-        """GIVEN the MCP tool raises an error,
-        WHEN the agent processes it, THEN the error is fed back to the LLM
-        AND the LLM can produce a final text response about the error."""
+    async def test_mcp_error_triggers_retry_and_succeeds(self, make_agent) -> None:
+        """GIVEN the MCP tool fails on the first attempt but succeeds on retry,
+        WHEN the agent processes the error and retries,
+        THEN the successful result is returned with status 'completed'."""
         llm = MockLLMProvider(responses=[
-            # LLM requests tool call
+            # Iteration 1: LLM requests tool call → tool fails
             LLMResponse(
                 content=None,
                 tool_calls=[
@@ -330,32 +363,98 @@ class TestMCPToolError:
                 model="test/mock-model",
                 usage=None,
             ),
-            # After receiving the error, LLM produces final text
+            # Iteration 2: LLM retries with a corrected path
             LLMResponse(
-                content="The secret at secret/missing was not found.",
-                tool_calls=None,
+                content=None,
+                tool_calls=[
+                    ToolCall(id="call_002", name="vault_kv_read", arguments={"path": "secret/found"}),
+                ],
                 model="test/mock-model",
                 usage=None,
             ),
         ])
 
-        class ErrorMCPClient(MockMCPClient):
-            async def call_tool(self, name: str, arguments: dict) -> ToolResult:
-                self.calls.append({"name": name, "arguments": arguments})
-                raise MCPError("Path not found: secret/missing")
+        call_count = 0
 
-        agent: AgentCore = make_agent(llm=llm, mcp=ErrorMCPClient())
+        class RetryMCPClient(MockMCPClient):
+            async def call_tool(self, name: str, arguments: dict) -> ToolResult:
+                nonlocal call_count
+                call_count += 1
+                self.calls.append({"name": name, "arguments": arguments})
+                if call_count == 1:
+                    raise MCPError("Path not found: secret/missing")
+                return ToolResult(
+                    content=json.dumps({"data": {"key": "value"}}),
+                    is_error=False,
+                )
+
+        agent: AgentCore = make_agent(llm=llm, mcp=RetryMCPClient())
         result = await agent.execute(prompt="read secret/missing")
 
         assert result.status == "completed"
-        assert "not found" in result.result.lower()
-        assert len(result.tool_calls) == 1
+        assert result.iterations == 2  # Took 2 iterations
+        assert len(result.tool_calls) == 2  # Both attempts recorded
         assert result.tool_calls[0].is_error is True
+        assert result.tool_calls[1].is_error is False
+        # Raw result should contain the successful result
+        assert len(result.raw_tool_results) == 1
+        assert result.raw_tool_results[0]["is_error"] is False
+        assert "value" in result.raw_tool_results[0]["result"]
+        # LLM was called twice (initial + retry)
+        assert len(llm.calls) == 2
 
     @pytest.mark.asyncio
-    async def test_mcp_error_message_in_tool_result(self, make_agent) -> None:
-        """GIVEN an MCP error, WHEN fed back to LLM,
-        THEN the tool result message in the conversation contains the error."""
+    async def test_mcp_error_exhausts_retries(self, make_agent) -> None:
+        """GIVEN the MCP tool fails on every attempt,
+        WHEN max_iterations is reached, THEN the last error is returned
+        with status 'error' and error_code 'max_iterations'."""
+        llm = MockLLMProvider(responses=[
+            # Iteration 1: tool call → fails
+            LLMResponse(
+                content=None,
+                tool_calls=[
+                    ToolCall(id="call_001", name="vault_kv_read", arguments={"path": "secret/missing"}),
+                ],
+                model="test/mock-model",
+                usage=None,
+            ),
+            # Iteration 2: retry → fails again
+            LLMResponse(
+                content=None,
+                tool_calls=[
+                    ToolCall(id="call_002", name="vault_kv_read", arguments={"path": "secret/other"}),
+                ],
+                model="test/mock-model",
+                usage=None,
+            ),
+        ])
+
+        class AlwaysErrorMCP(MockMCPClient):
+            async def call_tool(self, name: str, arguments: dict) -> ToolResult:
+                self.calls.append({"name": name, "arguments": arguments})
+                raise MCPError("Path not found")
+
+        config = AgentConfig(max_iterations=2)
+        agent: AgentCore = make_agent(llm=llm, mcp=AlwaysErrorMCP(), config=config)
+        result = await agent.execute(prompt="read secret/missing")
+
+        assert result.status == "error"
+        assert result.error_code == "max_iterations"
+        assert result.iterations == 2
+        assert len(result.tool_calls) == 2
+        assert all(tc.is_error for tc in result.tool_calls)
+        # Raw results should contain the last error
+        assert len(result.raw_tool_results) == 1
+        assert result.raw_tool_results[0]["is_error"] is True
+        assert "not found" in result.raw_tool_results[0]["result"].lower()
+        assert result.warning is not None
+        assert "max iterations" in result.warning.lower()
+
+    @pytest.mark.asyncio
+    async def test_mcp_error_message_in_raw_result(self, make_agent) -> None:
+        """GIVEN an MCP error with max_iterations=1 (no retries),
+        WHEN the error occurs, THEN the error message is returned as the
+        last error result after exhausting max_iterations."""
         llm = MockLLMProvider(responses=[
             LLMResponse(
                 content=None,
@@ -365,23 +464,136 @@ class TestMCPToolError:
                 model="test/mock-model",
                 usage=None,
             ),
-            LLMResponse(content="Error occurred.", tool_calls=None, model="test/mock-model", usage=None),
         ])
 
         class ErrorMCP(MockMCPClient):
             async def call_tool(self, name: str, arguments: dict) -> ToolResult:
                 raise MCPError("permission denied")
 
-        agent: AgentCore = make_agent(llm=llm, mcp=ErrorMCP())
+        config = AgentConfig(max_iterations=1)
+        agent: AgentCore = make_agent(llm=llm, mcp=ErrorMCP(), config=config)
         result = await agent.execute(prompt="read x")
 
-        # Check the LLM received the error in messages
-        second_call = llm.calls[1]
-        messages = second_call["messages"]
-        # Find the tool result message
-        tool_messages = [m for m in messages if m.get("role") == "tool"]
-        assert len(tool_messages) == 1
-        assert "permission denied" in tool_messages[0]["content"]
+        # The raw result should contain the error
+        assert len(result.raw_tool_results) == 1
+        raw = result.raw_tool_results[0]
+        assert raw["is_error"] is True
+        assert "permission denied" in raw["result"]
+
+        # The LLM was called once (no retry since max_iterations=1)
+        assert len(llm.calls) == 1
+        assert result.status == "error"
+        assert result.error_code == "max_iterations"
+
+    @pytest.mark.asyncio
+    async def test_llm_gives_up_with_text_after_error(self, make_agent) -> None:
+        """GIVEN a tool error, WHEN the LLM decides it cannot retry and
+        responds with text instead of a new tool call, THEN the text is
+        returned to the caller."""
+        llm = MockLLMProvider(responses=[
+            # Iteration 1: tool call → fails
+            LLMResponse(
+                content=None,
+                tool_calls=[
+                    ToolCall(id="call_001", name="vault_kv_read", arguments={"path": "secret/x"}),
+                ],
+                model="test/mock-model",
+                usage=None,
+            ),
+            # Iteration 2: LLM gives up and responds with text
+            LLMResponse(
+                content="I could not read the secret because the path does not exist.",
+                tool_calls=None,
+                model="test/mock-model",
+                usage=None,
+            ),
+        ])
+
+        class ErrorMCP(MockMCPClient):
+            async def call_tool(self, name: str, arguments: dict) -> ToolResult:
+                raise MCPError("path not found")
+
+        agent: AgentCore = make_agent(llm=llm, mcp=ErrorMCP())
+        result = await agent.execute(prompt="read secret/x")
+
+        assert result.status == "completed"
+        assert result.iterations == 2
+        assert "could not read" in result.result.lower()
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0].is_error is True
+
+    @pytest.mark.asyncio
+    async def test_hybrid_loop_mixed_results_retry_succeeds(self, make_agent) -> None:
+        """GIVEN the LLM requests 2 tool calls, one succeeds and one fails,
+        WHEN the loop retries and the LLM requests only the failed tool again,
+        THEN the final result is successful after 2 iterations.
+
+        Mixed Results (Retry-All Approach): When ANY tool fails in a batch,
+        the entire iteration is treated as failed. The errors are fed back to
+        the LLM which retries — potentially requesting a different subset of
+        tools on the next iteration."""
+        llm = MockLLMProvider(responses=[
+            # Iteration 1: LLM requests two tool calls — one will succeed, one will fail
+            LLMResponse(
+                content=None,
+                tool_calls=[
+                    ToolCall(id="call_001", name="vault_kv_read", arguments={"path": "secret/app"}),
+                    ToolCall(id="call_002", name="vault_kv_read", arguments={"path": "secret/missing"}),
+                ],
+                model="test/mock-model",
+                usage=None,
+            ),
+            # Iteration 2: LLM retries only the failed tool with a corrected path
+            LLMResponse(
+                content=None,
+                tool_calls=[
+                    ToolCall(id="call_003", name="vault_kv_read", arguments={"path": "secret/found"}),
+                ],
+                model="test/mock-model",
+                usage=None,
+            ),
+        ])
+
+        call_count = 0
+
+        class MixedResultsMCP(MockMCPClient):
+            async def call_tool(self, name: str, arguments: dict) -> ToolResult:
+                nonlocal call_count
+                call_count += 1
+                self.calls.append({"name": name, "arguments": arguments})
+                path = arguments.get("path", "")
+                if path == "secret/missing":
+                    raise MCPError("Path not found: secret/missing")
+                # All other paths succeed
+                return ToolResult(
+                    content=json.dumps({"data": {"key": "value"}}),
+                    is_error=False,
+                )
+
+        agent: AgentCore = make_agent(llm=llm, mcp=MixedResultsMCP())
+        result = await agent.execute(prompt="read secret/app and secret/missing")
+
+        # Final result should be successful (iteration 2 had no errors)
+        assert result.status == "completed"
+        assert result.iterations == 2
+
+        # Iteration 1 produced 2 tool call records (1 success + 1 error),
+        # iteration 2 produced 1 tool call record (success) = 3 total
+        assert len(result.tool_calls) == 3
+        assert result.tool_calls[0].is_error is False   # call_001: secret/app succeeded
+        assert result.tool_calls[1].is_error is True     # call_002: secret/missing failed
+        assert result.tool_calls[2].is_error is False    # call_003: secret/found succeeded
+
+        # Raw tool results come from the final (successful) iteration only
+        assert len(result.raw_tool_results) == 1
+        assert result.raw_tool_results[0]["is_error"] is False
+        assert "value" in result.raw_tool_results[0]["result"]
+
+        # LLM was called twice (initial + retry after mixed failure)
+        assert len(llm.calls) == 2
+
+        # MCP was called 3 times total (2 in iteration 1 + 1 in iteration 2)
+        assert call_count == 3
 
 
 # ===================================================================
@@ -390,25 +602,27 @@ class TestMCPToolError:
 
 
 class TestSecretRedactionInLoop:
-    """Verify that secret redaction is applied at every stage of the reasoning loop."""
+    """Verify that secret isolation is maintained in the reasoning loop.
+
+    Hybrid Loop Architecture: The LLM NEVER sees real tool results. On
+    success, a minimal acknowledgement (no secrets) is appended to messages.
+    On error, a REDACTED error message is appended. The raw Vault data is
+    returned directly to the API consumer. The audit trail
+    (ToolCallRecord.result) is still redacted for safe logging.
+    """
 
     @pytest.mark.asyncio
-    async def test_tool_result_redacted_before_llm_sees_it(self, make_agent) -> None:
+    async def test_llm_never_sees_tool_results(self, make_agent) -> None:
         """GIVEN the MCP returns a KV read with secret values,
-        WHEN the redacted result is fed to the LLM (in messages),
-        THEN the actual secret values do NOT appear in the LLM's messages."""
+        WHEN the reasoning loop completes,
+        THEN the LLM was only called ONCE (for tool selection) and never
+        received tool results in its messages."""
         llm = MockLLMProvider(responses=[
             LLMResponse(
                 content=None,
                 tool_calls=[
                     ToolCall(id="call_001", name="vault_kv_read", arguments={"path": "secret/db"}),
                 ],
-                model="test/mock-model",
-                usage=None,
-            ),
-            LLMResponse(
-                content="Read the secret successfully.",
-                tool_calls=None,
                 model="test/mock-model",
                 usage=None,
             ),
@@ -428,22 +642,24 @@ class TestSecretRedactionInLoop:
         agent: AgentCore = make_agent(llm=llm, mcp=mcp)
         result = await agent.execute(prompt="read secret/db")
 
-        # Check the messages sent to the LLM on the second call
-        second_call = llm.calls[1]
-        messages_json = json.dumps(second_call["messages"])
+        # LLM should have been called exactly once (tool selection only)
+        assert len(llm.calls) == 1
 
-        # The secret password must NOT appear in any message sent to LLM
-        assert secret_password not in messages_json, (
-            f"Secret value '{secret_password}' leaked into LLM messages!"
-        )
+        # The LLM's only call should NOT contain any tool results
+        first_call = llm.calls[0]
+        messages_json = json.dumps(first_call["messages"])
+        assert secret_password not in messages_json
+        assert "dbuser" not in messages_json
 
-        # But key names SHOULD appear (they're safe metadata)
-        assert "password" in messages_json or "keys" in messages_json
+        # But the raw result returned to the caller SHOULD contain real data
+        assert secret_password in result.result
+        assert "dbuser" in result.result
 
     @pytest.mark.asyncio
-    async def test_unredacted_data_available_for_consumer(self, make_agent) -> None:
+    async def test_raw_result_contains_actual_vault_data(self, make_agent) -> None:
         """GIVEN a tool call returns secret data,
-        WHEN the loop completes, THEN unredacted_responses contains the full data for the consumer."""
+        WHEN the loop completes, THEN raw_tool_results contains the full
+        unredacted Vault data for the consumer."""
         llm = MockLLMProvider(responses=[
             LLMResponse(
                 content=None,
@@ -453,7 +669,6 @@ class TestSecretRedactionInLoop:
                 model="test/mock-model",
                 usage=None,
             ),
-            LLMResponse(content="Done.", tool_calls=None, model="test/mock-model", usage=None),
         ])
 
         mcp = MockMCPClient(tool_results={
@@ -466,13 +681,12 @@ class TestSecretRedactionInLoop:
         agent: AgentCore = make_agent(llm=llm, mcp=mcp)
         result = await agent.execute(prompt="read secret/db")
 
-        assert len(result.unredacted_responses) >= 1
-        # The consumer should be able to find the real value
-        found = any(
-            "sk-real-key-12345" in json.dumps(r["response"])
-            for r in result.unredacted_responses
-        )
-        assert found, "Consumer should get unredacted data"
+        # Raw tool results should contain the real value
+        assert len(result.raw_tool_results) == 1
+        assert "sk-real-key-12345" in result.raw_tool_results[0]["result"]
+
+        # The result string should also contain the real value
+        assert "sk-real-key-12345" in result.result
 
     @pytest.mark.asyncio
     async def test_prompt_with_secret_data_is_sanitized(self, make_agent) -> None:
@@ -511,3 +725,147 @@ class TestSecretRedactionInLoop:
 
         assert result.status == "error"
         assert "unexpected error" in result.result.lower()
+
+
+# ===================================================================
+# Secret Restoration in Final Result for API Consumer
+# ===================================================================
+
+
+class TestSecretRestorationInResult:
+    """Verify placeholder restoration in the text-only path.
+
+    Raw-Response Architecture: When tools are called, raw Vault results are
+    returned directly — no placeholder restoration needed. Placeholder
+    restoration ONLY applies when the LLM responds with text (no tool calls),
+    which is the fallback/error path where the LLM couldn't map to a tool.
+    """
+
+    @pytest.mark.asyncio
+    async def test_placeholders_in_text_only_result_restored_from_secret_data(self, make_agent) -> None:
+        """GIVEN a prompt with secret_data causing placeholder substitution,
+        WHEN the LLM responds with text only (no tool calls) and echoes placeholders,
+        THEN the result text has real values restored for the API consumer."""
+        # The LLM will "see" the placeholder and echo it back
+        llm = MockLLMProvider(responses=[
+            LLMResponse(
+                content="I wrote the password [SECRET_VALUE_1] to kv/prod/db successfully.",
+                tool_calls=None,
+                model="test/mock-model",
+                usage=None,
+            ),
+        ])
+
+        agent: AgentCore = make_agent(llm=llm)
+        result = await agent.execute(
+            prompt="write to kv/prod/db",
+            secret_data={"password": "TopS3cret!"},
+        )
+
+        # The API consumer should see real values, not placeholders
+        assert "[SECRET_VALUE_" not in result.result
+        assert "TopS3cret!" in result.result
+
+    @pytest.mark.asyncio
+    async def test_multiple_placeholders_restored_in_text_only_result(self, make_agent) -> None:
+        """GIVEN a prompt with multiple secret_data values,
+        WHEN the LLM references multiple placeholders in text-only response,
+        THEN all placeholders are restored to real values."""
+        llm = MockLLMProvider(responses=[
+            LLMResponse(
+                content=(
+                    "I wrote username=[SECRET_VALUE_1] and "
+                    "password=[SECRET_VALUE_2] to kv/prod/db."
+                ),
+                tool_calls=None,
+                model="test/mock-model",
+                usage=None,
+            ),
+        ])
+
+        agent: AgentCore = make_agent(llm=llm)
+        result = await agent.execute(
+            prompt="write to kv/prod/db",
+            secret_data={"username": "admin", "password": "S3cret!"},
+        )
+
+        assert "[SECRET_VALUE_" not in result.result
+        assert "admin" in result.result
+        assert "S3cret!" in result.result
+
+    @pytest.mark.asyncio
+    async def test_result_without_placeholders_unchanged(self, make_agent) -> None:
+        """GIVEN a prompt with no secret_data (no placeholders created),
+        WHEN the LLM returns plain text, THEN the result is unchanged."""
+        llm = MockLLMProvider(responses=[
+            LLMResponse(
+                content="Listed all secrets under kv/prod/.",
+                tool_calls=None,
+                model="test/mock-model",
+                usage=None,
+            ),
+        ])
+
+        agent: AgentCore = make_agent(llm=llm)
+        result = await agent.execute(prompt="list secrets under kv/prod/")
+
+        assert result.result == "Listed all secrets under kv/prod/."
+
+    @pytest.mark.asyncio
+    async def test_tool_call_with_secret_data_returns_raw_vault_result(self, make_agent) -> None:
+        """GIVEN a write flow where the prompt had secret_data and the LLM
+        calls a tool, WHEN execute completes, THEN the result contains the
+        raw Vault response (not LLM text with placeholders).
+
+        Raw-Response Architecture: The tool result goes directly to the caller.
+        The LLM is not called again, so there's no text with placeholders to
+        restore. The secret_data placeholders were only used in the prompt
+        sanitization and tool argument restoration."""
+        llm = MockLLMProvider(responses=[
+            # LLM calls tool with placeholders in args
+            LLMResponse(
+                content=None,
+                tool_calls=[
+                    ToolCall(
+                        id="call_001",
+                        name="vault_kv_write",
+                        arguments={
+                            "path": "secret/app",
+                            "data": {
+                                "password": "[SECRET_VALUE_1]",
+                            },
+                        },
+                    ),
+                ],
+                model="test/mock-model",
+                usage=None,
+            ),
+        ])
+
+        mcp = MockMCPClient(tool_results={
+            "vault_kv_write": ToolResult(
+                content=json.dumps({"data": {"version": 1}}),
+                is_error=False,
+            ),
+        })
+
+        agent: AgentCore = make_agent(llm=llm, mcp=mcp)
+        result = await agent.execute(
+            prompt="write to secret/app",
+            secret_data={"password": "MyR3alP@ss!"},
+        )
+
+        # Result should be raw Vault response (write confirmation)
+        parsed = json.loads(result.result)
+        assert parsed == {"data": {"version": 1}}
+
+        # The LLM should only have been called once
+        assert len(llm.calls) == 1
+
+        # The MCP client should have received the real password
+        assert mcp.calls[0]["arguments"]["data"]["password"] == "MyR3alP@ss!"
+
+        # The LLM never saw the real password
+        first_call = llm.calls[0]
+        messages_json = json.dumps(first_call["messages"])
+        assert "MyR3alP@ss!" not in messages_json

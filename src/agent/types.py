@@ -4,15 +4,10 @@ Defines the data classes returned by the Agent Core's reasoning loop:
 
 - **ToolCallRecord**: Audit trail entry for a single MCP tool invocation.
 - **AgentResult**: The complete result of an ``AgentCore.execute()`` call,
-  including status, result text, tool call log, and unredacted secret data
-  for the API consumer.
+  including status, result text, and tool call log for internal debugging.
 
 These types are designed to be serializable (for API responses) and to carry
 all the information needed by the API layer to construct a ``TaskResponse``.
-
-Security note:
-    ``AgentResult.unredacted_responses`` contains real secret values intended
-    ONLY for the API consumer. This field MUST NOT be logged or sent to the LLM.
 """
 
 from __future__ import annotations
@@ -55,6 +50,14 @@ class AgentResult:
     This is the primary output of the agent's reasoning loop. The API layer
     uses it to construct the consumer-facing ``TaskResponse``.
 
+    **Raw-Response Architecture**:
+        The LLM is used ONLY for input processing — understanding the user's
+        intent and selecting the right tool(s) with the right arguments. After
+        tool execution, raw Vault results are returned directly to the API
+        caller without an LLM summarization step. The ``result`` field contains
+        the raw tool output (JSON string) when tools were called, or the LLM's
+        text when no tools were invoked (error/explanation case).
+
     Attributes
     ----------
     status:
@@ -62,19 +65,22 @@ class AgentResult:
         when the LLM reports a Vault error in its text), ``"error"`` for
         infrastructure failures (LLM down, MCP unreachable, etc.).
     result:
-        The agent's final text response from the LLM, or an error message
-        if ``status`` is ``"error"``.
+        When tools were called: a JSON string of the raw tool result(s).
+        When no tools were called: the LLM's text response (error/explanation).
+        When ``status`` is ``"error"``: an error message.
     tool_calls:
         Ordered list of tool invocations made during the reasoning loop.
         Arguments and results are **redacted** (safe for logging).
+        Kept for internal debugging/logging — not exposed in the API response.
     model_used:
         The LLM model ID that was used for completions.
     iterations:
         Number of reasoning loop iterations executed.
-    unredacted_responses:
-        Full, unredacted MCP tool responses for the API consumer. Each entry
-        is a dict with ``"tool_name"`` and ``"response"`` keys. This data
-        contains real secret values and MUST NOT be logged or sent to the LLM.
+    raw_tool_results:
+        Structured raw tool results for the API consumer. Each entry is a dict
+        with ``"tool_name"``, ``"result"`` (the raw MCP response), and
+        ``"is_error"`` keys. Populated when tool calls were made. The API layer
+        uses this as the primary ``data`` field in the response.
     warning:
         Optional warning message (e.g. ``"max iterations reached"``).
     error_code:
@@ -87,6 +93,6 @@ class AgentResult:
     tool_calls: list[ToolCallRecord] = field(default_factory=list)
     model_used: str = ""
     iterations: int = 0
-    unredacted_responses: list[dict[str, Any]] = field(default_factory=list)
+    raw_tool_results: list[dict[str, Any]] = field(default_factory=list)
     warning: str | None = None
     error_code: str | None = None

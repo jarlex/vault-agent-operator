@@ -1,8 +1,7 @@
 """POST /api/v1/tasks — submit a natural-language task to the agent.
 
 This is the primary endpoint. It validates the request, delegates to
-``AgentCore.execute()``, and builds a structured ``TaskResponse`` including
-unredacted secret data for the consumer.
+``AgentCore.execute()``, and builds a structured ``TaskResponse``.
 
 Every request is assigned a unique ``X-Request-ID`` header that is included
 in all log entries and returned in the response headers.
@@ -24,7 +23,6 @@ from src.api.schemas import (
     ErrorResponse,
     TaskRequest,
     TaskResponse,
-    ToolCallDetail,
 )
 from src.logging import get_logger
 
@@ -103,28 +101,16 @@ async def create_task(
         http_status = _error_code_to_http_status(result.error_code)
         response.status_code = http_status
 
-    # Build tool call audit trail
-    tool_calls = [
-        ToolCallDetail(
-            tool_name=tc.tool_name,
-            arguments=tc.arguments,
-            result=tc.result,
-            is_error=tc.is_error,
-            duration_ms=tc.duration_ms,
-        )
-        for tc in result.tool_calls
-    ]
-
-    # Build unredacted data for consumer (real secret values)
-    unredacted_data: list[dict[str, Any]] | None = None
-    if result.unredacted_responses:
-        unredacted_data = result.unredacted_responses
+    # Build structured raw tool results for consumer
+    raw_data: list[dict[str, Any]] | None = None
+    if result.raw_tool_results:
+        raw_data = result.raw_tool_results
 
     logger.info(
         "api.task.completed",
         status=result.status,
         model_used=result.model_used,
-        tool_call_count=len(tool_calls),
+        tool_call_count=len(result.tool_calls),
         duration_ms=duration_ms,
         error_code=result.error_code,
         client_cn=client_cn,
@@ -133,11 +119,10 @@ async def create_task(
     return TaskResponse(
         status=result.status,
         result=result.result,
+        data=raw_data,
         model_used=result.model_used,
-        tool_calls=tool_calls,
         duration_ms=duration_ms,
         error=result.result if result.status == "error" else None,
-        unredacted_data=unredacted_data,
     )
 
 

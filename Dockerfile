@@ -26,8 +26,8 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends gcc && \
     rm -rf /var/lib/apt/lists/*
 
-# Copy only dependency manifest first (layer caching)
-COPY pyproject.toml ./
+# Copy dependency manifest and README (hatchling needs README for metadata)
+COPY pyproject.toml README.md ./
 
 # Install dependencies into a separate prefix for clean copy
 RUN pip install --no-cache-dir --prefix=/install .
@@ -37,7 +37,8 @@ RUN pip install --no-cache-dir --prefix=/install .
 # ---------------------------------------------------------------------------
 FROM hashicorp/vault-mcp-server:latest AS mcp-server
 
-# The binary is at /vault-mcp-server in the official image
+# The binary is at /bin/vault-mcp-server in the official release image
+# (release-default target places it at /bin/vault-mcp-server)
 # We just need this stage to COPY FROM it
 
 # ---------------------------------------------------------------------------
@@ -63,7 +64,7 @@ WORKDIR /app
 COPY --from=builder /install /usr/local
 
 # Copy vault-mcp-server binary from official image
-COPY --from=mcp-server /vault-mcp-server /usr/local/bin/vault-mcp-server
+COPY --from=mcp-server /bin/vault-mcp-server /usr/local/bin/vault-mcp-server
 RUN chmod +x /usr/local/bin/vault-mcp-server
 
 # Copy application source and config

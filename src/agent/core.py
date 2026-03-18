@@ -1,8 +1,21 @@
-"""Agent Core — reasoning loop and tool dispatch for vault-operator-agent.
+"""Agent Core — hybrid reasoning loop and tool dispatch for vault-operator-agent.
 
 This module implements the central agent logic: it takes a natural-language
-prompt, runs an iterative reasoning loop against an LLM, dispatches tool calls
+prompt, runs a hybrid reasoning loop against an LLM, dispatches tool calls
 to the MCP server, and returns a structured result.
+
+**Hybrid Loop Architecture**:
+    The loop combines a fast single-pass path with error-retry capability:
+
+    - **All tools succeed** → Return raw Vault results directly to the API
+      caller WITHOUT a second LLM call (fast/happy path).
+    - **Any tool fails** → Feed the redacted error back to the LLM → LLM
+      retries with different parameters or a different approach → loop
+      continues up to ``max_iterations``.
+    - **After max_iterations with only errors** → Return the last error to
+      the caller.
+    - **LLM returns text (no tool calls)** → Return text to caller directly.
+    - **LLM returns empty** → Return error to caller.
 
 Security Model (CRITICAL):
     The agent enforces a strict secret-value isolation protocol at every stage
@@ -15,13 +28,11 @@ Security Model (CRITICAL):
        When the LLM generates a tool call containing placeholders, real values
        are substituted back BEFORE the call reaches the MCP server.
 
-    3. **MCP result → SecretRedactor.redact_tool_result → LLM**: Secret values
-       in MCP responses are stripped BEFORE the result enters the LLM conversation.
-       Only metadata, key names, and paths are shown to the LLM.
+    3. **MCP result → API consumer**: Raw MCP tool results are returned directly
+       to the API consumer. The LLM NEVER sees successful tool results.
 
-    4. **MCP result (unredacted) → SecretContext → API consumer**: The full,
-       unredacted tool response is stored in the SecretContext and included in
-       the AgentResult for the API consumer who explicitly requested the data.
+    4. **MCP error → redacted → LLM**: When a tool fails, the error message
+       is REDACTED before being fed back to the LLM for retry reasoning.
 
     The LLM NEVER sees real secret values at ANY point in the loop.
 
@@ -72,6 +83,20 @@ class AgentCore:
     tool calls to the vault-mcp-server via the MCPClient, and enforcing secret
     value isolation at every stage.
 
+    **Stateless Design (CRITICAL)**:
+        Each call to ``execute()`` is completely independent — no conversation
+        history, tool results, or user context persists between calls. The
+        instance holds only reusable infrastructure (LLM provider, MCP client,
+        config, sanitizer, redactor — all of which are stateless). Per-request
+        state (messages, SecretContext, tool call log) is created fresh in each
+        ``execute()`` call and destroyed at the end.
+
+    **API-Executor Behavior**:
+        The agent operates as an API executor, not a chatbot. The system prompt
+        instructs the LLM to never ask clarifying questions and to always
+        attempt to execute operations immediately. This is enforced via the
+        system prompt at ``config/prompts/system.md``.
+
     Parameters
     ----------
     llm_provider:
@@ -112,9 +137,16 @@ class AgentCore:
         2. Sanitizes the prompt (replaces secret values with placeholders).
         3. Builds the initial message list (system prompt + sanitized user prompt).
         4. Retrieves available tools from the MCP client.
-        5. Runs the reasoning loop: LLM completion → tool dispatch → repeat.
-        6. Returns a structured AgentResult with redacted audit trail and
-           unredacted data for the API consumer.
+        5. Calls the LLM to interpret the prompt and select tool(s).
+        6. Executes the selected tool(s) against Vault.
+        7. Returns the raw tool results directly (no LLM summarization).
+
+        **Raw-Response Architecture**:
+            The LLM is only used for INPUT processing (steps 2-5). After tools
+            execute, their raw results go directly to the API caller without
+            passing through the LLM again. If the LLM responds with text instead
+            of tool calls (meaning it couldn't map the request to a tool), that
+            text is returned as-is.
 
         Parameters
         ----------
@@ -130,8 +162,8 @@ class AgentCore:
         Returns
         -------
         AgentResult
-            The complete execution result including status, text response,
-            tool call audit trail, and unredacted secret data.
+            The complete execution result including status, raw tool results,
+            and tool call audit trail.
         """
         start_time = time.monotonic()
 
@@ -162,6 +194,15 @@ class AgentCore:
                     error_code="internal_error",
                 )
 
+            # Restore placeholder tokens in the result text ONLY for the
+            # text-only path (when the LLM responded with text instead of
+            # tool calls).  In the raw-response path, raw_tool_results
+            # already contain the actual Vault data (they were never
+            # redacted).  The text path is the fallback when no tools were
+            # called — the LLM may have echoed placeholders in its text.
+            if not result.raw_tool_results and ctx.has_placeholders():
+                result.result = ctx.resolve_all_placeholders(result.result)
+
         duration_ms = int((time.monotonic() - start_time) * 1000)
 
         logger.info(
@@ -169,6 +210,7 @@ class AgentCore:
             status=result.status,
             iterations=result.iterations,
             tool_call_count=len(result.tool_calls),
+            raw_tool_result_count=len(result.raw_tool_results),
             model_used=result.model_used,
             duration_ms=duration_ms,
             warning=result.warning,
@@ -189,8 +231,18 @@ class AgentCore:
     ) -> AgentResult:
         """Core reasoning loop implementation.
 
-        This method contains the actual loop logic, separated from ``execute()``
-        for cleaner error handling and SecretContext lifecycle management.
+        **Raw-Response Architecture**:
+            The loop calls the LLM once to interpret the prompt and select
+            tool(s). After tools execute, their raw results are returned
+            directly to the caller — the LLM is NOT called again for
+            summarization.
+
+            If the LLM responds with text instead of tool calls (it couldn't
+            map the request to a tool), that text is returned as-is.
+
+            The loop supports multiple iterations ONLY for the case where
+            tool execution fails and the error is fed back to the LLM for
+            a retry with different parameters.
         """
         # Step 1: Sanitize the user prompt
         sanitized_prompt = self._sanitizer.sanitize_prompt(
@@ -217,9 +269,12 @@ class AgentCore:
                 path=self._config.system_prompt_path,
             )
             system_prompt = (
-                "You are a Vault operator agent. Use the available tools to "
-                "execute Vault operations. Secret values in tool results are "
-                "redacted — reference secrets by their key names and paths only."
+                "You are a Vault operator agent that acts as an API executor. "
+                "Use the available tools to execute Vault operations immediately. "
+                "NEVER ask clarifying questions — always attempt to execute. "
+                "Secret values in tool results are redacted — reference secrets "
+                "by their key names and paths only. If you cannot fulfill the "
+                "request, return a clear error message."
             )
 
         # Step 4: Build initial messages
@@ -228,11 +283,12 @@ class AgentCore:
             {"role": "user", "content": sanitized_prompt},
         ]
 
-        # Step 5: Reasoning loop
+        # Step 5: Reasoning loop — LLM selects tool(s), we execute and return raw results
         tool_call_log: list[ToolCallRecord] = []
         model_used = ""
         max_iterations = self._config.max_iterations
         llm_response: LLMResponse | None = None
+        last_error_results: list[dict[str, Any]] | None = None
 
         for iteration in range(1, max_iterations + 1):
             logger.info(
@@ -262,7 +318,6 @@ class AgentCore:
                     tool_calls=tool_call_log,
                     model_used=model_used or (model or ""),
                     iterations=iteration,
-                    unredacted_responses=ctx.get_unredacted_responses(),
                     error_code=self._classify_llm_error(exc),
                 )
 
@@ -271,22 +326,57 @@ class AgentCore:
             # Check for tool calls
             if llm_response.tool_calls:
                 # Process each tool call
-                new_records = await self._dispatch_tool_calls(
+                new_records, raw_results = await self._dispatch_tool_calls(
                     llm_response=llm_response,
                     messages=messages,
                     ctx=ctx,
                 )
                 tool_call_log.extend(new_records)
 
+                # HYBRID LOOP: Check if ALL tool calls succeeded.
+                has_errors = any(r["is_error"] for r in raw_results)
+
+                if not has_errors:
+                    # FAST PATH: All tools succeeded → return raw results
+                    # directly to the caller without a second LLM call.
+                    if len(raw_results) == 1:
+                        result_str = raw_results[0]["result"]
+                    else:
+                        result_str = json.dumps(raw_results)
+
+                    return AgentResult(
+                        status="completed",
+                        result=result_str,
+                        tool_calls=tool_call_log,
+                        model_used=model_used,
+                        iterations=iteration,
+                        raw_tool_results=raw_results,
+                    )
+
+                # ERROR RETRY PATH: At least one tool failed. The redacted
+                # error has already been appended to messages by
+                # _execute_single_tool(). Continue the loop so the LLM
+                # sees the error and can retry with different parameters
+                # or a different approach.
+                logger.info(
+                    "agent.loop.error_retry",
+                    iteration=iteration,
+                    total_tools=len(raw_results),
+                    failed_tools=sum(1 for r in raw_results if r["is_error"]),
+                )
+                last_error_results = raw_results
+                continue
+
             elif llm_response.content:
-                # Final text response — reasoning loop is done
+                # LLM responded with text instead of tool calls — this means
+                # it couldn't map the request to a tool. Return the text as-is
+                # (it's an error/explanation from the LLM).
                 return AgentResult(
                     status="completed",
                     result=llm_response.content,
                     tool_calls=tool_call_log,
                     model_used=model_used,
                     iterations=iteration,
-                    unredacted_responses=ctx.get_unredacted_responses(),
                 )
 
             else:
@@ -302,18 +392,39 @@ class AgentCore:
                     tool_calls=tool_call_log,
                     model_used=model_used,
                     iterations=iteration,
-                    unredacted_responses=ctx.get_unredacted_responses(),
                     error_code="empty_response",
                 )
 
-        # Max iterations reached without a final text response
+        # Max iterations reached without a successful tool execution.
+        # This means every iteration resulted in tool errors and the LLM
+        # could not recover. Return the last error to the caller.
         logger.warning(
             "agent.max_iterations",
             max_iterations=max_iterations,
             tool_call_count=len(tool_call_log),
         )
 
-        # Try to extract any partial content from the last response
+        # If we have error results from the last failed tool dispatch,
+        # return them so the caller sees the actual error.
+        if last_error_results is not None:
+            if len(last_error_results) == 1:
+                result_str = last_error_results[0]["result"]
+            else:
+                result_str = json.dumps(last_error_results)
+
+            return AgentResult(
+                status="error",
+                result=result_str,
+                tool_calls=tool_call_log,
+                model_used=model_used,
+                iterations=max_iterations,
+                raw_tool_results=last_error_results,
+                warning=f"Max iterations ({max_iterations}) reached — tool errors not resolved",
+                error_code="max_iterations",
+            )
+
+        # Fallback: no tool errors captured (shouldn't happen in normal flow,
+        # but defensive coding for edge cases like repeated empty responses).
         fallback_msg = (
             "The agent reached the maximum number of reasoning iterations "
             f"({max_iterations}) without producing a final response."
@@ -325,12 +436,11 @@ class AgentCore:
         )
 
         return AgentResult(
-            status="completed",
+            status="error",
             result=last_content,
             tool_calls=tool_call_log,
             model_used=model_used,
             iterations=max_iterations,
-            unredacted_responses=ctx.get_unredacted_responses(),
             warning=f"Max iterations ({max_iterations}) reached",
             error_code="max_iterations",
         )
@@ -344,15 +454,16 @@ class AgentCore:
         llm_response: LLMResponse,
         messages: list[dict[str, Any]],
         ctx: SecretContext,
-    ) -> list[ToolCallRecord]:
+    ) -> tuple[list[ToolCallRecord], list[dict[str, Any]]]:
         """Process tool calls from an LLM response.
 
         For each tool call:
         1. Restore placeholder tokens to real values in arguments.
         2. Call the MCP tool with real arguments.
-        3. Redact the tool result for the LLM.
-        4. Store the unredacted result in SecretContext.
-        5. Append the tool call and redacted result to the message list.
+        3. Store the raw (unredacted) result for direct return to API consumer.
+        4. On ERROR: append the redacted error to messages (for LLM retry).
+        5. On SUCCESS: append a minimal acknowledgement to messages (required
+           by the OpenAI API format, but contains no secrets).
         6. Record the call in the audit trail (with redacted arguments).
 
         Parameters
@@ -360,19 +471,23 @@ class AgentCore:
         llm_response:
             The LLM response containing tool calls.
         messages:
-            The mutable message list — tool calls and results are appended.
+            The mutable message list — error results are appended for retry;
+            successful results get a minimal ack appended.
         ctx:
             The request-scoped SecretContext.
 
         Returns
         -------
-        list[ToolCallRecord]
-            Audit trail entries for each tool invocation.
+        tuple[list[ToolCallRecord], list[dict[str, Any]]]
+            A tuple of (audit trail entries, raw tool results). Each raw result
+            is a dict with ``"tool_name"``, ``"result"`` (raw MCP response string),
+            and ``"is_error"`` keys.
         """
         records: list[ToolCallRecord] = []
+        raw_results: list[dict[str, Any]] = []
 
         if not llm_response.tool_calls:
-            return records
+            return records, raw_results
 
         # Append the assistant message with tool calls to the conversation
         # This is required by the OpenAI API format: the assistant message
@@ -396,40 +511,45 @@ class AgentCore:
         messages.append(assistant_message)
 
         for tool_call in llm_response.tool_calls:
-            record = await self._execute_single_tool(tool_call, messages, ctx)
+            record, raw_result = await self._execute_single_tool(tool_call, messages, ctx)
             records.append(record)
+            raw_results.append(raw_result)
 
-        return records
+        return records, raw_results
 
     async def _execute_single_tool(
         self,
         tool_call: ToolCall,
         messages: list[dict[str, Any]],
         ctx: SecretContext,
-    ) -> ToolCallRecord:
+    ) -> tuple[ToolCallRecord, dict[str, Any]]:
         """Execute a single MCP tool call with full security flow.
 
         Security flow:
             1. LLM tool call args (may contain placeholders)
             2. → restore_placeholders → real values
             3. → MCP server (receives real values)
-            4. → MCP result (may contain secrets)
-            5. → redact_tool_result → redacted for LLM (stored in messages)
-            6. → unredacted stored in SecretContext (for API consumer)
+            4. → Raw MCP result returned directly to API consumer
+            5. On ERROR: redacted error appended to messages (for LLM retry)
+            6. On SUCCESS: result is NOT appended to messages (LLM never sees it)
 
         Parameters
         ----------
         tool_call:
             The tool call from the LLM response.
         messages:
-            The mutable message list — the tool result is appended.
+            The mutable message list — only error results are appended (so the
+            LLM can see them for retry). Successful results are NOT appended
+            because the LLM never needs to see them (raw-response architecture).
         ctx:
             The request-scoped SecretContext.
 
         Returns
         -------
-        ToolCallRecord
-            Audit trail entry with redacted arguments and result.
+        tuple[ToolCallRecord, dict[str, Any]]
+            A tuple of (audit trail entry, raw tool result dict). The raw result
+            has keys ``"tool_name"``, ``"result"`` (raw MCP content), and
+            ``"is_error"``.
         """
         tool_name = tool_call.name
         redacted_arguments = tool_call.arguments  # These are what the LLM produced (safe for logging)
@@ -445,6 +565,17 @@ class AgentCore:
         real_arguments = self._redactor.restore_placeholders(
             arguments=tool_call.arguments,
             context=ctx,
+        )
+
+        # WARNING: DEBUG logging of real_arguments may expose secret values
+        # (after placeholder restoration).  Only enable DEBUG level in
+        # development environments.
+        logger.debug(
+            "agent.tool_call.arguments",
+            tool_name=tool_name,
+            tool_call_id=tool_call.id,
+            llm_arguments=redacted_arguments,
+            resolved_arguments=real_arguments,
         )
 
         # Step 2: Call MCP tool with real arguments
@@ -464,7 +595,7 @@ class AgentCore:
                 duration_ms=duration_ms,
             )
 
-            # Report the error to the LLM for reasoning
+            # Report the error to the LLM for reasoning (retry path)
             # Redact any secret values that may appear in the error message
             safe_error = self._redactor.redact_error_message(str(exc), ctx)
             error_result = json.dumps({
@@ -473,11 +604,19 @@ class AgentCore:
                 "tool_name": tool_name,
             })
 
+            # Append error to messages so the LLM can see it on the next
+            # iteration and retry with different parameters/approach.
             messages.append({
                 "role": "tool",
                 "tool_call_id": tool_call.id,
                 "content": error_result,
             })
+
+            raw_result = {
+                "tool_name": tool_name,
+                "result": error_result,
+                "is_error": True,
+            }
 
             return ToolCallRecord(
                 tool_name=tool_name,
@@ -485,23 +624,42 @@ class AgentCore:
                 result=error_result,
                 is_error=True,
                 duration_ms=duration_ms,
-            )
+            ), raw_result
 
         duration_ms = int((time.monotonic() - start_time) * 1000)
 
-        # Step 3: Redact the tool result for the LLM
-        # This also stores the unredacted result in SecretContext
+        # WARNING: DEBUG logging of raw MCP result.  This will contain
+        # secret values (passwords, tokens, keys, etc.).  Only enable
+        # DEBUG level in development environments.
+        logger.debug(
+            "agent.tool_call.raw_result",
+            tool_name=tool_name,
+            tool_call_id=tool_call.id,
+            is_error=mcp_result.is_error,
+            duration_ms=duration_ms,
+            raw_content=mcp_result.content,
+        )
+
+        # Step 3: Redact the tool result for the audit trail only.
+        # In the raw-response architecture, successful tool results are NOT
+        # appended to messages — the LLM never sees them.  We only redact
+        # for the ToolCallRecord audit log.
         redacted_result = self._redactor.redact_tool_result(
             tool_name=tool_name,
             result=mcp_result.content,
             context=ctx,
         )
 
-        # Step 4: Append redacted result to messages for the LLM
+        # Step 4: Append a minimal tool result message.  The OpenAI API
+        # requires a tool-result message for every tool_call_id in the
+        # assistant message.  We must satisfy this contract so that, if
+        # the loop continues (due to another tool failing), the message
+        # list is valid.  The content is a short acknowledgement — it
+        # does NOT contain secret values.
         messages.append({
             "role": "tool",
             "tool_call_id": tool_call.id,
-            "content": redacted_result,
+            "content": json.dumps({"status": "ok", "tool_name": tool_name}),
         })
 
         logger.info(
@@ -512,13 +670,20 @@ class AgentCore:
             duration_ms=duration_ms,
         )
 
+        # Build raw result for direct return to API consumer
+        raw_result = {
+            "tool_name": tool_name,
+            "result": mcp_result.content,
+            "is_error": mcp_result.is_error,
+        }
+
         return ToolCallRecord(
             tool_name=tool_name,
             arguments=redacted_arguments,
             result=redacted_result,
             is_error=mcp_result.is_error,
             duration_ms=duration_ms,
-        )
+        ), raw_result
 
     # ------------------------------------------------------------------
     # Internal: Error Classification
