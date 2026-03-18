@@ -2,12 +2,11 @@
 # vault-operator-agent — Production-like Docker Compose
 # =============================================================================
 # Services:
-#   - vault-operator-agent: The AI agent (FastAPI + vault-mcp-server binary)
+#   - vault-operator-agent: The AI agent (Go binary + vault-mcp-server binary)
 #   - vault: HashiCorp Vault in dev mode
 #
 # Prerequisites:
 #   - Generate certs: ./scripts/generate-certs.sh
-#   - Create secrets: mkdir -p secrets && echo "dev-token" > secrets/vault_token
 #   - Set GITHUB_TOKEN env var
 #
 # Usage:
@@ -22,6 +21,10 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        VERSION: ${VERSION:-dev}
+        COMMIT: ${COMMIT:-unknown}
+        BUILD_DATE: ${BUILD_DATE:-unknown}
     container_name: vault-operator-agent
     ports:
       - "8000:8000"
@@ -41,7 +44,7 @@ services:
       - GITHUB_TOKEN=${GITHUB_TOKEN}
       - LLM__DEFAULT_MODEL=${LLM_DEFAULT_MODEL:-default}
       # Logging
-      - LOGGING__LEVEL=${LOG_LEVEL:-INFO}
+      - LOGGING__LEVEL=${LOG_LEVEL:-info}
       # Scheduler
       - SCHEDULER__ENABLED=${SCHEDULER_ENABLED:-true}
     volumes:
@@ -50,7 +53,9 @@ services:
       vault:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:8000/api/v1/health"]
+      # distroless has no curl/wget; use wget from busybox or rely on
+      # the Go binary itself. We use a simple TCP check via the runtime.
+      test: ["CMD", "/app/vault-agent-operator", "--healthcheck"]
       interval: 30s
       timeout: 10s
       start_period: 15s

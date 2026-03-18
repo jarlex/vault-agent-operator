@@ -5,8 +5,14 @@
 # Checks the /api/v1/health endpoint and exits with appropriate code.
 # Supports both mTLS and non-mTLS modes.
 #
-# Usage (inside container):
-#   /app/scripts/healthcheck.sh
+# For distroless containers, use the Go binary's --healthcheck flag instead:
+#   /app/vault-agent-operator --healthcheck
+#
+# This script is for non-distroless images or host-side health checks
+# that have curl and jq available.
+#
+# Usage (outside container or in non-distroless image):
+#   ./scripts/healthcheck.sh
 #
 # Environment:
 #   MTLS_ENABLED — "true" to use mTLS certs, anything else for plain HTTP
@@ -30,8 +36,14 @@ else
     response=$(curl -sf --max-time 5 "${HEALTH_URL}" 2>/dev/null) || exit 1
 fi
 
-# Check if status is "healthy" or "degraded" (both are acceptable)
-status=$(echo "${response}" | python3 -c "import sys,json; print(json.load(sys.stdin).get('status',''))" 2>/dev/null || echo "")
+# Parse status from JSON response.
+# Try jq first (preferred), fall back to grep pattern match.
+if command -v jq &>/dev/null; then
+    status=$(echo "${response}" | jq -r '.status // ""' 2>/dev/null || echo "")
+else
+    # Fallback: simple pattern extraction without jq or python
+    status=$(echo "${response}" | grep -oP '"status"\s*:\s*"\K[^"]+' 2>/dev/null || echo "")
+fi
 
 case "${status}" in
     healthy|degraded)

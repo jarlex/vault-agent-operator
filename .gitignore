@@ -1,16 +1,15 @@
-# Python
-__pycache__/
-*.py[cod]
-*$py.class
-*.egg-info/
-dist/
-build/
-*.egg
+# Go
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+vendor/
 
-# Virtual environments
-.venv/
-venv/
-env/
+# Binary output
+vault-agent-operator
 
 # IDE
 .idea/
@@ -22,7 +21,7 @@ env/
 .DS_Store
 Thumbs.db
 
-# Certificates (sensitive — generated locally)
+# Certificates (sensitive - generated locally)
 certs/*.pem
 
 # Environment / secrets
@@ -30,9 +29,12 @@ certs/*.pem
 secrets/
 
 # Test / coverage
-.coverage
-htmlcov/
-.pytest_cache/
+coverage.out
+coverage.html
 
-# mypy
+# Python leftovers (can be removed after migration)
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
 .mypy_cache/

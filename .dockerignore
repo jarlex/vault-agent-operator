@@ -2,7 +2,10 @@
 .git
 .gitignore
 
-# Python bytecode & caches
+# Tests (not needed in production image)
+tests/
+
+# Python artifacts (legacy — being removed)
 __pycache__
 *.pyc
 *.pyo
@@ -10,18 +13,17 @@ __pycache__
 .mypy_cache
 .pytest_cache
 .ruff_cache
-
-# Virtual environments
 venv/
 .venv/
-
-# Tests (not needed in production image)
-tests/
+src/
+pyproject.toml
+uv.lock
 
 # Environment & secrets
 .env
 .env.*
 certs/
+secrets/
 
 # Node (if any tooling uses it)
 node_modules/
@@ -41,7 +43,6 @@ Dockerfile
 openspec/
 .atl/
 *.md
-!README.md
 !config/**/*.md
 
 # Build artifacts

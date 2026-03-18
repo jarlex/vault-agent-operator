@@ -39,15 +39,15 @@ llm:
   models:
     - name: "default"
       provider: "github"
-      model_id: "github/gpt-4o"
+      model_id: "gpt-4o"
       supports_tool_calling: true
     - name: "fast"
       provider: "github"
-      model_id: "github/gpt-4o-mini"
+      model_id: "gpt-4o-mini"
       supports_tool_calling: true
     - name: "llama"
       provider: "github"
-      model_id: "github/meta-llama-3.1-70b-instruct"
+      model_id: "meta-llama-3.1-70b-instruct"
       supports_tool_calling: true
 
 agent:

@@ -97,6 +97,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        VERSION: mvp
     container_name: vault-operator-agent-mvp
     ports:
       - "8000:8000"
@@ -117,7 +119,7 @@ services:
       # Logging — DEBUG level for development (shows MCP tool requests/responses)
       # WARNING: DEBUG level may expose secret values in logs. Use INFO or
       # higher in production.
-      - LOGGING__LEVEL=DEBUG
+      - LOGGING__LEVEL=debug
       - LOGGING__FORMAT=console
       # Scheduler — disabled for MVP simplicity
       - SCHEDULER__ENABLED=false
@@ -127,7 +129,7 @@ services:
       vault-seed:
         condition: service_completed_successfully
     healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:8000/api/v1/health"]
+      test: ["CMD", "/app/vault-agent-operator", "--healthcheck"]
       interval: 15s
       timeout: 10s
       start_period: 20s
