@@ -2,22 +2,11 @@
 .git
 .gitignore
 
-# Tests (not needed in production image)
-tests/
-
-# Python artifacts (legacy — being removed)
-__pycache__
-*.pyc
-*.pyo
-*.pyd
-.mypy_cache
-.pytest_cache
-.ruff_cache
-venv/
-.venv/
-src/
-pyproject.toml
-uv.lock
+# Go test and build artifacts
+*_test.go
+coverage.out
+coverage.html
+mcp_coverage.out
 
 # Environment & secrets
 .env
@@ -46,6 +35,4 @@ openspec/
 !config/**/*.md
 
 # Build artifacts
-dist/
-build/
-*.egg-info
+vendor/
